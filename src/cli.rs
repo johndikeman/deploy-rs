@@ -101,11 +101,14 @@ pub struct Opts {
     #[arg(long)]
     temp_path: Option<PathBuf>,
     /// Show what will be activated on the machines
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["test", "boot"])]
     dry_activate: bool,
     /// Don't activate, but update the boot loader to boot into the new profile
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["test", "dry_activate"])]
     boot: bool,
+    /// Activate the configuration, but don't update the boot loader
+    #[arg(long, conflicts_with_all = ["boot", "dry_activate"])]
+    test: bool,
     /// Revoke all previously succeeded deploys when deploying multiple profiles
     #[arg(long)]
     rollback_succeeded: Option<bool>,
@@ -455,6 +458,7 @@ async fn run_deploy(
     debug_logs: bool,
     dry_activate: bool,
     boot: bool,
+    test: bool,
     log_dir: &Option<String>,
     rollback_succeeded: bool,
     mp: MultiProgress,
@@ -809,7 +813,7 @@ async fn run_deploy(
     let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];
     for (_, deploy_data, deploy_defs) in &parts {
         if let Err(e) =
-            deploy::deploy::deploy_profile(deploy_data, deploy_defs, dry_activate, boot).await
+            deploy::deploy::deploy_profile(deploy_data, deploy_defs, dry_activate, boot, test).await
         {
             error!("{}", e);
             if dry_activate {
@@ -881,10 +885,6 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         &deploy::LoggerType::Deploy,
     )?;
 
-    if opts.dry_activate && opts.boot {
-        error!("Cannot use both --dry-activate & --boot!");
-    }
-
     let deploys = opts
         .clone()
         .targets
@@ -954,6 +954,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         opts.debug_logs,
         opts.dry_activate,
         opts.boot,
+        opts.test,
         &opts.log_dir,
         opts.rollback_succeeded.unwrap_or(true),
         mp,

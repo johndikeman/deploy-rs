@@ -89,6 +89,10 @@ struct ActivateOpts {
     #[arg(long)]
     boot: bool,
 
+    /// Activate the configuration, but don't update the boot loader
+    #[arg(long)]
+    test: bool,
+
     /// Path for any temporary files that may be needed during activation
     #[arg(long)]
     temp_path: PathBuf,
@@ -427,6 +431,7 @@ pub async fn activate(
     magic_rollback: bool,
     dry_activate: bool,
     boot: bool,
+    test: bool,
 ) -> Result<(), ActivateError> {
     if !dry_activate {
         info!("Activating profile");
@@ -469,6 +474,7 @@ pub async fn activate(
         .env("PROFILE", activation_location)
         .env("DRY_ACTIVATE", if dry_activate { "1" } else { "0" })
         .env("BOOT", if boot { "1" } else { "0" })
+        .env("TEST", if test { "1" } else { "0" })
         .current_dir(activation_location);
     let activate_status = match activate_command
         .status()
@@ -610,6 +616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             activate_opts.magic_rollback,
             activate_opts.dry_activate,
             activate_opts.boot,
+            activate_opts.test,
         )
         .await
         .map_err(|x| Box::new(x) as Box<dyn std::error::Error>),

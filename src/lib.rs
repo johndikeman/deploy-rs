@@ -213,6 +213,7 @@ pub struct CmdOverrides {
     pub ssh_user: Option<String>,
     pub profile_user: Option<String>,
     pub ssh_opts: Option<String>,
+    pub groups: Option<Vec<String>>,
     pub fast_connection: Option<bool>,
     pub auto_rollback: Option<bool>,
     pub hostname: Option<String>,

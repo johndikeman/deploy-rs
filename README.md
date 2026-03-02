@@ -32,6 +32,8 @@ If you want to deploy multiple flakes or a subset of profiles with one invocatio
 
 Running in this mode, if any of the deploys fails, the deploy will be aborted and all successful deploys rolled back. `--rollback-succeeded false` can be used to override this behavior, otherwise the `auto-rollback` argument takes precedent.
 
+You can also filter which profiles are deployed by group using `deploy --groups <group> [<group> ...]`. A profile is selected if any of the requested groups appears in its merged `groups` set.
+
 If you require a signing key to push closures to your server, specify the path to it in the `LOCAL_KEY` environment variable.
 
 Check out `deploy --help` for CLI flags! Remember to check there before making one-time changes to things like hostnames.
@@ -212,6 +214,10 @@ This is a set of options that can be put in any of the above definitions, with t
 
   # This is an optional list of arguments that will be passed to SSH.
   sshOpts = [ "-p" "2121" ];
+
+  # Optional groups used for filtering deployments.
+  # Can be a string or a list of strings; values from profile > node > deploy are merged as a set (deduplicated).
+  groups = [ "web" "prod" ];
 
   # Fast connection to the node. If this is true, copy the whole closure instead of letting the node substitute.
   # This defaults to `false`

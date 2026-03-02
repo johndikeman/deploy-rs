@@ -18,6 +18,19 @@
                         "type": "string"
                     }
                 },
+                "groups": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        }
+                    ]
+                },
                 "fastConnection": {
                     "type": ["boolean", "null"]
                 },

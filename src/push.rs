@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::data::ProfileSettings;
 use indicatif::ProgressBar;
 use log::{debug, info, warn};
 use std::collections::HashMap;
@@ -97,6 +98,8 @@ pub enum PushProfileError {
              Is there a mismatch in deploy-rs used in the flake you're deploying and deploy-rs command you're running?"
     )]
     ActivateRsDoesntExist,
+    #[error("Failed to resolve floating-output store path via `nix path-info`: {0}")]
+    ResolveClosure(String),
 }
 
 #[derive(Clone)]
@@ -114,7 +117,7 @@ pub struct PushProfileData {
 pub async fn build_profile_locally(
     data: &PushProfileData,
     derivation_name: &str,
-) -> Result<(), PushProfileError> {
+) -> Result<String, PushProfileError> {
     info!(
         "Building profile `{}` for node `{}`",
         data.deploy_data.profile_name, data.deploy_data.node_name
@@ -186,27 +189,13 @@ pub async fn build_profile_locally(
         a => return Err(PushProfileError::BuildExit(a)),
     };
 
-    if !Path::new(
-        format!(
-            "{}/deploy-rs-activate",
-            data.deploy_data.profile.profile_settings.path
-        )
-        .as_str(),
-    )
-    .exists()
-    {
+    let closure = resolve_closure(&data.deploy_data.profile.profile_settings, None, None).await?;
+
+    if !Path::new(format!("{}/deploy-rs-activate", closure).as_str()).exists() {
         return Err(PushProfileError::DeployRsActivateDoesntExist);
     }
 
-    if !Path::new(
-        format!(
-            "{}/activate-rs",
-            data.deploy_data.profile.profile_settings.path
-        )
-        .as_str(),
-    )
-    .exists()
-    {
+    if !Path::new(format!("{}/activate-rs", closure).as_str()).exists() {
         return Err(PushProfileError::ActivateRsDoesntExist);
     }
 
@@ -222,13 +211,13 @@ pub async fn build_profile_locally(
             .arg("-r")
             .arg("-k")
             .arg(local_key)
-            .arg(&data.deploy_data.profile.profile_settings.path);
+            .arg(&closure);
         command::Command::new(sign_command)
             .status()
             .await
             .map_err(PushProfileError::Sign)?;
     }
-    Ok(())
+    Ok(closure)
 }
 
 // Nix `internal-json` activity types (see nix's `logging.hh`).
@@ -449,7 +438,7 @@ async fn update_pb_with_child_output(pb: &ProgressBar, child: &mut Child) {
 pub async fn build_profile_remotely(
     data: &PushProfileData,
     derivation_name: &str,
-) -> Result<(), PushProfileError> {
+) -> Result<String, PushProfileError> {
     info!(
         "Building profile `{}` for node `{}` on remote host",
         data.deploy_data.profile_name, data.deploy_data.node_name
@@ -550,88 +539,114 @@ pub async fn build_profile_remotely(
         a => return Err(PushProfileError::BuildExit(a)),
     };
 
-    Ok(())
+    // The realised output lives on the remote store, so resolve it over ssh-ng.
+    resolve_closure(&data.deploy_data.profile.profile_settings, Some(&store_address), Some(&ssh_opts_str)).await
 }
 
-pub async fn build_profile(data: &PushProfileData) -> Result<(), PushProfileError> {
-    debug!(
-        "Finding the deriver of store path for {}",
-        &data.deploy_data.profile.profile_settings.path
-    );
+pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfileError> {
+    let profile_settings = &data.deploy_data.profile.profile_settings;
 
-    // `nix-store --query --deriver` doesn't work on invalid paths, so we parse output of show-derivation :(
-    let mut show_derivation_command = Command::new("nix");
-    show_derivation_command
-        .arg("--experimental-features")
-        .arg("nix-command")
-        .arg("show-derivation")
-        .arg(&data.deploy_data.profile.profile_settings.path);
-    let show_derivation_command_str = format!("{:?}", show_derivation_command);
+    let supports_caret = data.supports_flakes || data.deploy_data.merged_settings.remote_build.unwrap_or(false);
 
-    let show_derivation_output = command::Command::new(show_derivation_command)
-        .run()
-        .await
-        .map_err(PushProfileError::ShowDerivation)?;
+    // The eval transformation in `nix/transform-deploy.nix` attaches `drvPath`
+    // to every derivation-typed profile path, so this branch is hit whenever
+    // the user's `path` resolves to a derivation. Using `drvPath` directly also
+    // bypasses `nix show-derivation`, which cannot resolve floating-output
+    // placeholder paths. The legacy branch below remains for the case where
+    // the user wrote a literal store path string in their `deploy` attribute.
+    let deriver = if let Some(drv_path) = &profile_settings.drv_path {
+        debug!("Using drvPath from flake: {}", drv_path);
+        deriver_for_build(drv_path.clone(), supports_caret).await?
+    } else {
+        debug!(
+            "Finding the deriver of store path for {}",
+            &profile_settings.path
+        );
 
-    match show_derivation_output.status.code() {
-        Some(0) => (),
-        _exit_code => {
-            return Err(PushProfileError::ShowDerivation(
-                command::CommandError::Exit(show_derivation_output, show_derivation_command_str),
-            ));
-        }
-    };
+        // `nix-store --query --deriver` doesn't work on invalid paths, so we parse output of show-derivation :(
+        let mut show_derivation_command = Command::new("nix");
+        show_derivation_command
+            .arg("--experimental-features")
+            .arg("nix-command")
+            .arg("show-derivation")
+            .arg(&profile_settings.path);
+        let show_derivation_command_str = format!("{:?}", show_derivation_command);
 
-    let show_derivation_json: serde_json::value::Value = serde_json::from_str(
-        std::str::from_utf8(&show_derivation_output.stdout).map_err(|err| {
+        let show_derivation_output = command::Command::new(show_derivation_command)
+            .run()
+            .await
+            .map_err(PushProfileError::ShowDerivation)?;
+
+        match show_derivation_output.status.code() {
+            Some(0) => (),
+            _exit_code => {
+                return Err(PushProfileError::ShowDerivation(
+                    command::CommandError::Exit(show_derivation_output, show_derivation_command_str),
+                ));
+            }
+        };
+
+        let show_derivation_json: serde_json::value::Value = serde_json::from_str(
+            std::str::from_utf8(&show_derivation_output.stdout).map_err(|err| {
+                PushProfileError::ShowDerivation(command::CommandError::OtherError(
+                    ShowDerivationError::Utf8(err),
+                ))
+            })?,
+        )
+        .map_err(|err| {
             PushProfileError::ShowDerivation(command::CommandError::OtherError(
-                ShowDerivationError::Utf8(err),
+                ShowDerivationError::Parse(err),
             ))
-        })?,
-    )
-    .map_err(|err| {
-        PushProfileError::ShowDerivation(command::CommandError::OtherError(
-            ShowDerivationError::Parse(err),
-        ))
-    })?;
+        })?;
 
-    // Nix 2.33+ nests derivations under a "derivations" key, so try to get that first
-    let derivation_info = show_derivation_json
-        .get("derivations")
-        .unwrap_or(&show_derivation_json)
-        .as_object()
-        .ok_or(PushProfileError::ShowDerivation(
-            command::CommandError::OtherError(ShowDerivationError::Invalid),
-        ))?;
+        // Nix 2.33+ nests derivations under a "derivations" key, so try to get that first
+        let derivation_info = show_derivation_json
+            .get("derivations")
+            .unwrap_or(&show_derivation_json)
+            .as_object()
+            .ok_or(PushProfileError::ShowDerivation(
+                command::CommandError::OtherError(ShowDerivationError::Invalid),
+            ))?;
 
-    let deriver_key = derivation_info
-        .keys()
-        .next()
-        .ok_or(PushProfileError::ShowDerivation(
-            command::CommandError::OtherError(ShowDerivationError::Empty),
-        ))?;
+        let deriver_key = derivation_info.keys().next().ok_or(
+            PushProfileError::ShowDerivation(command::CommandError::OtherError(
+                ShowDerivationError::Empty,
+            )),
+        )?;
 
-    // Nix 2.32+ returns relative paths (without /nix/store/ prefix) in show-derivation output
-    // Normalize to always use full store paths
-    let deriver = if deriver_key.starts_with("/nix/store/") {
-        deriver_key.to_string()
-    } else {
-        format!("/nix/store/{}", deriver_key)
+        // Nix 2.32+ returns relative paths (without /nix/store/ prefix) in show-derivation output
+        // Normalize to always use full store paths
+        let deriver = if deriver_key.starts_with("/nix/store/") {
+            deriver_key.to_string()
+        } else {
+            format!("/nix/store/{}", deriver_key)
+        };
+
+        deriver_for_build(deriver, supports_caret).await?
     };
 
-    let new_deriver = if data.supports_flakes
-        || data
-            .deploy_data
-            .merged_settings
-            .remote_build
-            .unwrap_or(false)
-    {
-        // Since nix 2.15.0 'nix build <path>.drv' will build only the .drv file itself, not the
-        // derivation outputs, '^out' is used to refer to outputs explicitly
-        deriver.clone() + "^out"
+    if data.deploy_data.merged_settings.remote_build.unwrap_or(false) {
+        if !data.supports_flakes {
+            warn!("remote builds using non-flake nix are experimental");
+        }
+
+        build_profile_remotely(data, &deriver).await
     } else {
-        deriver.clone()
-    };
+        build_profile_locally(data, &deriver).await
+    }
+}
+
+/// Picks the `nix build` argument shape for a given deriver, accounting for the
+/// pre/post 2.15 split: on 2.15 and newer, `nix build <drv>` builds only the
+/// `.drv` itself and `^out` is needed to select outputs; on older Nix,
+/// `nix build <drv>` already builds outputs and `^out` is not understood. We
+/// detect which case applies by asking `nix path-info <drv>`; on 2.15 and newer
+/// it echoes the `.drv` back, while on older versions it resolves to the
+/// realised output or errors out if the output is not yet built.
+async fn deriver_for_build(deriver: String, supports_caret: bool) -> Result<String, PushProfileError> {
+    if !supports_caret {
+        return Ok(deriver);
+    }
 
     let mut path_info_command = Command::new("nix");
     path_info_command
@@ -644,42 +659,84 @@ pub async fn build_profile(data: &PushProfileData) -> Result<(), PushProfileErro
         .await
         .map_err(PushProfileError::PathInfo)?;
 
-    let deriver = if std::str::from_utf8(&path_info_output.stdout).map(|s| s.trim())
-        == Ok(deriver.as_str())
-    {
-        // In this case we're on 2.15.0 or newer, because 'nix path-info <...>.drv'
-        // returns the same '<...>.drv' path.
-        // If 'nix path-info <...>.drv' returns a different path, then we're on pre 2.15.0 nix and
-        // derivation build result is already present in the /nix/store.
-        new_deriver
+    if std::str::from_utf8(&path_info_output.stdout).map(|s| s.trim()) == Ok(deriver.as_str()) {
+        Ok(format!("{}^out", deriver))
     } else {
-        // If 'nix path-info <...>.drv' returns a different path, then we're on pre 2.15.0 nix and
-        // derivation build result is already present in the /nix/store.
-        //
-        // Alternatively, the result of the derivation build may not be yet present
-        // in the /nix/store. In this case, 'nix path-info' returns
-        // 'error: path '...' is not valid'.
-        deriver
-    };
-    if data
-        .deploy_data
-        .merged_settings
-        .remote_build
-        .unwrap_or(false)
-    {
-        if !data.supports_flakes {
-            warn!("remote builds using non-flake nix are experimental");
-        }
-
-        build_profile_remotely(data, &deriver).await?;
-    } else {
-        build_profile_locally(data, &deriver).await?;
+        Ok(deriver)
     }
-
-    Ok(())
 }
 
-pub async fn push_profile(data: &PushProfileData) -> Result<(), PushProfileError> {
+/// Returns the realised `/nix/store/...` path of the profile's output.
+///
+/// For traditional input-addressed derivations the eval-time `path` is already
+/// the realised path, so we just clone it. For content-addressed and
+/// floating-output derivations the eval-time `path` is a placeholder; the
+/// realised path is only known after build, so we ask Nix for it via
+/// `path-info <drv>^out`. When `store_address` is set the query runs against
+/// that remote store.
+async fn resolve_closure(
+    profile_settings: &ProfileSettings,
+    store_address: Option<&str>,
+    ssh_opts: Option<&str>,
+) -> Result<String, PushProfileError> {
+    if profile_settings.path.starts_with("/nix/store/") {
+        return Ok(profile_settings.path.clone());
+    }
+
+    // Placeholder path; the floating output's drvPath is required to resolve it.
+    let drv_path = profile_settings.drv_path.as_deref().ok_or_else(|| {
+        PushProfileError::ResolveClosure(format!(
+            "profile path `{}` is not a `/nix/store/` path and no derivation is associated with it; \
+             set `path` to a derivation such as `deploy-rs.lib.${{system}}.activate.nixos cfg` \
+             rather than a literal string",
+            profile_settings.path
+        ))
+    })?;
+
+    let target = format!("{}^out", drv_path);
+
+    let mut cmd = Command::new("nix");
+    cmd.arg("--experimental-features").arg("nix-command");
+    if let Some(addr) = store_address {
+        cmd.arg("--store").arg(addr);
+    }
+    cmd.arg("path-info").arg(&target);
+    if let Some(opts) = ssh_opts {
+        cmd.env("NIX_SSHOPTS", opts);
+    }
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| PushProfileError::ResolveClosure(e.to_string()))?;
+
+    if !output.status.success() {
+        return Err(PushProfileError::ResolveClosure(format!(
+            "`nix path-info {}` exited with {:?}: {}",
+            target,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let resolved = std::str::from_utf8(&output.stdout)
+        .map_err(|e| PushProfileError::ResolveClosure(e.to_string()))?
+        .lines()
+        .next()
+        .ok_or_else(|| {
+            PushProfileError::ResolveClosure(format!(
+                "`nix path-info {}` produced no output",
+                target
+            ))
+        })?
+        .trim()
+        .to_string();
+
+    debug!("Resolved floating output {} to {}", drv_path, resolved);
+    Ok(resolved)
+}
+
+pub async fn push_profile(data: &PushProfileData, closure: &str) -> Result<(), PushProfileError> {
     let ssh_opts_str = data
         .deploy_data
         .merged_settings
@@ -722,7 +779,7 @@ pub async fn push_profile(data: &PushProfileData) -> Result<(), PushProfileError
         copy_command
             .arg("--to")
             .arg(format!("ssh://{}@{}", data.deploy_defs.ssh_user, hostname))
-            .arg(&data.deploy_data.profile.profile_settings.path)
+            .arg(closure)
             .env("NIX_SSHOPTS", ssh_opts_str);
 
         debug!("copy command: {:?}", copy_command);
@@ -760,3 +817,53 @@ pub async fn push_profile(data: &PushProfileData) -> Result<(), PushProfileError
 
     Ok(())
 }
+
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn settings(path: &str, drv_path: Option<&str>) -> ProfileSettings {
+        ProfileSettings {
+            path: path.to_string(),
+            profile_path: None,
+            drv_path: drv_path.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn input_addressed_path_passes_through_without_shelling_out() {
+        // For traditional /nix/store paths there is nothing to resolve; the
+        // eval value is already the realised closure, so we must not invoke
+        // nix.
+        let s = settings("/nix/store/abc123def456-example", None);
+        let resolved = resolve_closure(&s, None, None)
+            .await
+            .expect("input-addressed path should resolve trivially");
+        assert_eq!(resolved, "/nix/store/abc123def456-example");
+    }
+
+    #[tokio::test]
+    async fn placeholder_without_drv_path_returns_actionable_error() {
+        // The profile path is a floating-output placeholder but no drvPath was
+        // attached, which happens if a user writes a literal placeholder string
+        // in their deploy attribute. The error must surface the bad path and
+        // point at the fix, which is to use a derivation rather than a string.
+        let s = settings("/03vx4812vk1s8y0chf9cky6s2ggmz1vb", None);
+        let err = resolve_closure(&s, None, None).await.expect_err(
+            "placeholder path without drvPath must error before shelling out",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/03vx4812vk1s8y0chf9cky6s2ggmz1vb"),
+            "error names the offending path: {}",
+            msg
+        );
+        assert!(
+            msg.contains("derivation"),
+            "error explains the fix involves a derivation: {}",
+            msg
+        );
+    }
+}
+

@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::data::ProfileSettings;
 use indicatif::ProgressBar;
 use log::{debug, info, warn};
 use std::collections::HashMap;
@@ -98,8 +97,12 @@ pub enum PushProfileError {
              Is there a mismatch in deploy-rs used in the flake you're deploying and deploy-rs command you're running?"
     )]
     ActivateRsDoesntExist,
-    #[error("Failed to resolve floating-output store path via `nix path-info`: {0}")]
-    ResolveClosure(String),
+    #[error("Nix build command output contained an invalid UTF-8 sequence: {0}")]
+    BuildStdoutUtf8(std::str::Utf8Error),
+    #[error("Nix build command succeeded but printed no output path")]
+    BuildStdoutEmpty,
+    #[error("Nix build command printed multiple output paths, expected exactly one: {0}")]
+    BuildStdoutMultiline(String),
 }
 
 #[derive(Clone)]
@@ -130,7 +133,10 @@ pub async fn build_profile_locally(
     };
 
     if data.supports_flakes {
-        build_command.arg("build").arg(derivation_name)
+        // `--print-out-paths` makes `nix build` write the realised output
+        // to stdout. `nix-build` writes the path to stdout by default so
+        // the flag only applies to the flake branch.
+        build_command.arg("build").arg(derivation_name).arg("--print-out-paths")
     } else {
         build_command.arg(derivation_name)
     };
@@ -153,43 +159,65 @@ pub async fn build_profile_locally(
 
     build_command.args(data.extra_build_args.clone());
 
-    build_command
-        // Logging should be in stderr, this just stops the store path from printing for no reason
-        .stdout(Stdio::null());
-
     debug!("build command: {:?}", build_command);
 
-    // When a progress bar is attached, pipe nix's stderr and route each line
-    // through the spinner's message. Otherwise nix detects the terminal and
-    // draws its own `[x/y built]` bar directly, which corrupts the display.
-    let build_status = if let Some(pb) = &data.deploy_data.progressbar {
+    // Capture stdout so we can read the realised store path. When a progress
+    // bar is attached, stderr is also piped and routed through the spinner's
+    // message via `update_pb_with_child_output`; otherwise stderr is left
+    // inherited so nix's native build logs stream straight to the terminal.
+    let build_output = if let Some(pb) = &data.deploy_data.progressbar {
         // `internal-json` gives us structured progress to render in the spinner
         // instead of nix's own (terminal-drawing) progress bar.
         build_command.arg("--log-format").arg("internal-json");
         let mut child = build_command
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
 
+        // The realised store path arrives on stdout as a plain line, while
+        // only stderr carries the `@nix ...` progress events, so read stdout
+        // ourselves while the spinner consumes stderr.
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut buf)
+                .await
+                .map(|_| buf)
+        });
+
         update_pb_with_child_output(pb, &mut child).await;
 
-        child
+        let status = child
             .wait()
             .await
-            .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?
+            .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
+        let stdout = stdout_task
+            .await
+            .map_err(|e| {
+                PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(e)))
+            })?
+            .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
+
+        std::process::Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        }
     } else {
+        build_command.stdout(Stdio::piped()).stderr(Stdio::inherit());
         command::Command::new(build_command)
-            .status()
+            .run()
             .await
             .map_err(PushProfileError::Build)?
     };
 
-    match build_status.code() {
+    match build_output.status.code() {
         Some(0) => (),
         a => return Err(PushProfileError::BuildExit(a)),
     };
 
-    let closure = resolve_closure(&data.deploy_data.profile.profile_settings, None, None).await?;
+    let closure = parse_build_out_path(&build_output.stdout)?;
 
     if !Path::new(format!("{}/deploy-rs-activate", closure).as_str()).exists() {
         return Err(PushProfileError::DeployRsActivateDoesntExist);
@@ -496,7 +524,7 @@ pub async fn build_profile_remotely(
         a => return Err(PushProfileError::CopyExit(a)),
     };
 
-    let build_exit_status = {
+    let build_output = {
         let mut build_command = Command::new("nix");
         build_command
             .arg("build")
@@ -505,6 +533,7 @@ pub async fn build_profile_remotely(
             .arg("auto")
             .arg("--store")
             .arg(&store_address)
+            .arg("--print-out-paths")
             .args(data.extra_build_args.clone())
             .env("NIX_SSHOPTS", ssh_opts_str.clone());
 
@@ -518,29 +547,52 @@ pub async fn build_profile_remotely(
                 .spawn()
                 .expect("failed to spawn nix build command");
 
+            // The realised store path arrives on stdout as a plain line,
+            // while only stderr carries the `@nix ...` progress events, so
+            // read stdout ourselves while the spinner consumes stderr.
+            let mut stdout = child.stdout.take().expect("stdout was piped");
+            let stdout_task = tokio::spawn(async move {
+                let mut buf = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut buf)
+                    .await
+                    .map(|_| buf)
+            });
+
             update_pb_with_child_output(pb, &mut child).await;
 
-            child
+            let status = child
                 .wait()
                 .await
-                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?
+                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
+            let stdout = stdout_task
+                .await
+                .map_err(|e| {
+                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(e)))
+                })?
+                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
+
+            std::process::Output {
+                status,
+                stdout,
+                stderr: Vec::new(),
+            }
         } else {
             // No progress bar: let nix write its native output to the terminal.
             debug!("build command: {:?}", build_command);
-            build_command
-                .status()
+            build_command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+            command::Command::new(build_command)
+                .run()
                 .await
-                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?
+                .map_err(PushProfileError::Build)?
         }
     };
 
-    match build_exit_status.code() {
+    match build_output.status.code() {
         Some(0) => (),
         a => return Err(PushProfileError::BuildExit(a)),
     };
 
-    // The realised output lives on the remote store, so resolve it over ssh-ng.
-    resolve_closure(&data.deploy_data.profile.profile_settings, Some(&store_address), Some(&ssh_opts_str)).await
+    parse_build_out_path(&build_output.stdout)
 }
 
 pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfileError> {
@@ -666,82 +718,24 @@ async fn deriver_for_build(deriver: String, supports_caret: bool) -> Result<Stri
     }
 }
 
-/// Returns the realised `/nix/store/...` path of the profile's output.
+/// Extracts the realised `/nix/store/...` path from `nix build`'s stdout.
 ///
-/// Two branches:
-///
-/// * The transform in `nix/transform-deploy.nix` attaches `drvPath` whenever
-///   the user's `path` resolves to a derivation. In that case the eval-time
-///   `path` may be a content-addressed placeholder, a floating-output
-///   placeholder, or, for nested dynamic derivations, a path whose name
-///   ends in `.drv` rather than a real directory. None of those shapes are
-///   usable as a closure without first resolving them, so we always ask
-///   Nix for the realised output via `path-info <drv>^out`. When
-///   `store_address` is set the query runs against that remote store.
-/// * If `drvPath` is absent, the user wrote a literal string in their
-///   `deploy` attribute. We trust that string if it points into `/nix/store`
-///   and otherwise return an actionable error.
-async fn resolve_closure(
-    profile_settings: &ProfileSettings,
-    store_address: Option<&str>,
-    ssh_opts: Option<&str>,
-) -> Result<String, PushProfileError> {
-    let drv_path = match profile_settings.drv_path.as_deref() {
-        Some(d) => d,
-        None => {
-            if profile_settings.path.starts_with("/nix/store/") {
-                return Ok(profile_settings.path.clone());
-            }
-            return Err(PushProfileError::ResolveClosure(format!(
-                "profile path `{}` is not a `/nix/store/` path and no derivation is associated with it; \
-                 set `path` to a derivation such as `deploy-rs.lib.${{system}}.activate.nixos cfg` \
-                 rather than a literal string",
-                profile_settings.path
-            )));
-        }
-    };
+/// Both `nix build --print-out-paths` and `nix-build` write one path per
+/// line. A deploy-rs build asks for exactly one output, so anything other
+/// than a single non-empty line is rejected rather than silently truncated.
+fn parse_build_out_path(stdout: &[u8]) -> Result<String, PushProfileError> {
+    let text = std::str::from_utf8(stdout).map_err(PushProfileError::BuildStdoutUtf8)?;
+    let trimmed = text.trim();
 
-    let target = format!("{}^out", drv_path);
-
-    let mut cmd = Command::new("nix");
-    cmd.arg("--experimental-features").arg("nix-command");
-    if let Some(addr) = store_address {
-        cmd.arg("--store").arg(addr);
+    if trimmed.is_empty() {
+        return Err(PushProfileError::BuildStdoutEmpty);
     }
-    cmd.arg("path-info").arg(&target);
-    if let Some(opts) = ssh_opts {
-        cmd.env("NIX_SSHOPTS", opts);
+    if trimmed.contains('\n') {
+        return Err(PushProfileError::BuildStdoutMultiline(trimmed.to_string()));
     }
 
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| PushProfileError::ResolveClosure(e.to_string()))?;
-
-    if !output.status.success() {
-        return Err(PushProfileError::ResolveClosure(format!(
-            "`nix path-info {}` exited with {:?}: {}",
-            target,
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    let resolved = std::str::from_utf8(&output.stdout)
-        .map_err(|e| PushProfileError::ResolveClosure(e.to_string()))?
-        .lines()
-        .next()
-        .ok_or_else(|| {
-            PushProfileError::ResolveClosure(format!(
-                "`nix path-info {}` produced no output",
-                target
-            ))
-        })?
-        .trim()
-        .to_string();
-
-    debug!("Resolved floating output {} to {}", drv_path, resolved);
-    Ok(resolved)
+    debug!("Built closure {}", trimmed);
+    Ok(trimmed.to_string())
 }
 
 pub async fn push_profile(data: &PushProfileData, closure: &str) -> Result<(), PushProfileError> {
@@ -831,72 +825,33 @@ pub async fn push_profile(data: &PushProfileData, closure: &str) -> Result<(), P
 mod test {
     use super::*;
 
-    fn settings(path: &str, drv_path: Option<&str>) -> ProfileSettings {
-        ProfileSettings {
-            path: path.to_string(),
-            profile_path: None,
-            drv_path: drv_path.map(str::to_string),
-        }
+    #[test]
+    fn parse_build_out_path_returns_single_line() {
+        // The happy path: `nix build --print-out-paths` writes exactly one
+        // store path followed by a newline.
+        let stdout = b"/nix/store/abc123-example\n";
+        let path = parse_build_out_path(stdout).expect("single-line stdout must parse");
+        assert_eq!(path, "/nix/store/abc123-example");
     }
 
-    #[tokio::test]
-    async fn input_addressed_path_passes_through_without_shelling_out() {
-        // For traditional /nix/store paths there is nothing to resolve; the
-        // eval value is already the realised closure, so we must not invoke
-        // nix.
-        let s = settings("/nix/store/abc123def456-example", None);
-        let resolved = resolve_closure(&s, None, None)
-            .await
-            .expect("input-addressed path should resolve trivially");
-        assert_eq!(resolved, "/nix/store/abc123def456-example");
+    #[test]
+    fn parse_build_out_path_rejects_empty_output() {
+        // `nix build` can exit 0 without emitting a realised path under some
+        // dynamic-derivation failure modes. Surfacing the missing closure
+        // here keeps it from being silently fed into a downstream
+        // activate-script check as an empty string.
+        let err = parse_build_out_path(b"").expect_err("empty stdout must error");
+        assert!(matches!(err, PushProfileError::BuildStdoutEmpty));
     }
 
-    #[tokio::test]
-    async fn placeholder_without_drv_path_returns_actionable_error() {
-        // The profile path is a floating-output placeholder but no drvPath was
-        // attached, which happens if a user writes a literal placeholder string
-        // in their deploy attribute. The error must surface the bad path and
-        // point at the fix, which is to use a derivation rather than a string.
-        let s = settings("/03vx4812vk1s8y0chf9cky6s2ggmz1vb", None);
-        let err = resolve_closure(&s, None, None).await.expect_err(
-            "placeholder path without drvPath must error before shelling out",
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("/03vx4812vk1s8y0chf9cky6s2ggmz1vb"),
-            "error names the offending path: {}",
-            msg
-        );
-        assert!(
-            msg.contains("derivation"),
-            "error explains the fix involves a derivation: {}",
-            msg
-        );
-    }
-
-    #[tokio::test]
-    async fn derivation_typed_path_is_resolved_via_drv_path_even_when_path_looks_like_store() {
-        // Nested dynamic derivations produce an eval-time `outPath` of the
-        // form `/nix/store/<hash>-<name>.drv`. The string starts with
-        // `/nix/store/` but is the .drv file itself, not the realised output
-        // directory. Whenever drvPath is attached, the resolver must always
-        // go through `nix path-info <drv>^out` and must not trust the
-        // eval-time `path` verbatim. Confirm by passing in a drvPath that
-        // doesn't exist: the resolver should attempt the resolution and
-        // surface a ResolveClosure error rather than silently returning the
-        // bogus path.
-        let s = settings(
-            "/nix/store/0000000000000000000000000000000000-fake-1.0.drv",
-            Some("/nix/store/0000000000000000000000000000000000-fake-1.0.drv"),
-        );
-        let err = resolve_closure(&s, None, None)
-            .await
-            .expect_err("drv-typed path must be resolved via path-info, not trusted verbatim");
-        assert!(
-            matches!(err, PushProfileError::ResolveClosure(_)),
-            "must error through ResolveClosure: {}",
-            err
-        );
+    #[test]
+    fn parse_build_out_path_rejects_multiple_outputs() {
+        // deploy-rs builds exactly one `out` per profile, so more than one
+        // line on stdout means our invocation has drifted from what the rest
+        // of the pipeline expects. Refuse rather than silently picking one.
+        let stdout = b"/nix/store/a\n/nix/store/b\n";
+        let err = parse_build_out_path(stdout).expect_err("multiline stdout must error");
+        assert!(matches!(err, PushProfileError::BuildStdoutMultiline(_)));
     }
 }
 

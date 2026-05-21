@@ -668,30 +668,38 @@ async fn deriver_for_build(deriver: String, supports_caret: bool) -> Result<Stri
 
 /// Returns the realised `/nix/store/...` path of the profile's output.
 ///
-/// For traditional input-addressed derivations the eval-time `path` is already
-/// the realised path, so we just clone it. For content-addressed and
-/// floating-output derivations the eval-time `path` is a placeholder; the
-/// realised path is only known after build, so we ask Nix for it via
-/// `path-info <drv>^out`. When `store_address` is set the query runs against
-/// that remote store.
+/// Two branches:
+///
+/// * The transform in `nix/transform-deploy.nix` attaches `drvPath` whenever
+///   the user's `path` resolves to a derivation. In that case the eval-time
+///   `path` may be a content-addressed placeholder, a floating-output
+///   placeholder, or, for nested dynamic derivations, a path whose name
+///   ends in `.drv` rather than a real directory. None of those shapes are
+///   usable as a closure without first resolving them, so we always ask
+///   Nix for the realised output via `path-info <drv>^out`. When
+///   `store_address` is set the query runs against that remote store.
+/// * If `drvPath` is absent, the user wrote a literal string in their
+///   `deploy` attribute. We trust that string if it points into `/nix/store`
+///   and otherwise return an actionable error.
 async fn resolve_closure(
     profile_settings: &ProfileSettings,
     store_address: Option<&str>,
     ssh_opts: Option<&str>,
 ) -> Result<String, PushProfileError> {
-    if profile_settings.path.starts_with("/nix/store/") {
-        return Ok(profile_settings.path.clone());
-    }
-
-    // Placeholder path; the floating output's drvPath is required to resolve it.
-    let drv_path = profile_settings.drv_path.as_deref().ok_or_else(|| {
-        PushProfileError::ResolveClosure(format!(
-            "profile path `{}` is not a `/nix/store/` path and no derivation is associated with it; \
-             set `path` to a derivation such as `deploy-rs.lib.${{system}}.activate.nixos cfg` \
-             rather than a literal string",
-            profile_settings.path
-        ))
-    })?;
+    let drv_path = match profile_settings.drv_path.as_deref() {
+        Some(d) => d,
+        None => {
+            if profile_settings.path.starts_with("/nix/store/") {
+                return Ok(profile_settings.path.clone());
+            }
+            return Err(PushProfileError::ResolveClosure(format!(
+                "profile path `{}` is not a `/nix/store/` path and no derivation is associated with it; \
+                 set `path` to a derivation such as `deploy-rs.lib.${{system}}.activate.nixos cfg` \
+                 rather than a literal string",
+                profile_settings.path
+            )));
+        }
+    };
 
     let target = format!("{}^out", drv_path);
 
@@ -863,6 +871,31 @@ mod test {
             msg.contains("derivation"),
             "error explains the fix involves a derivation: {}",
             msg
+        );
+    }
+
+    #[tokio::test]
+    async fn derivation_typed_path_is_resolved_via_drv_path_even_when_path_looks_like_store() {
+        // Nested dynamic derivations produce an eval-time `outPath` of the
+        // form `/nix/store/<hash>-<name>.drv`. The string starts with
+        // `/nix/store/` but is the .drv file itself, not the realised output
+        // directory. Whenever drvPath is attached, the resolver must always
+        // go through `nix path-info <drv>^out` and must not trust the
+        // eval-time `path` verbatim. Confirm by passing in a drvPath that
+        // doesn't exist: the resolver should attempt the resolution and
+        // surface a ResolveClosure error rather than silently returning the
+        // bogus path.
+        let s = settings(
+            "/nix/store/0000000000000000000000000000000000-fake-1.0.drv",
+            Some("/nix/store/0000000000000000000000000000000000-fake-1.0.drv"),
+        );
+        let err = resolve_closure(&s, None, None)
+            .await
+            .expect_err("drv-typed path must be resolved via path-info, not trusted verbatim");
+        assert!(
+            matches!(err, PushProfileError::ResolveClosure(_)),
+            "must error through ResolveClosure: {}",
+            err
         );
     }
 }

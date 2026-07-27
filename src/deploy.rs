@@ -284,7 +284,7 @@ pub enum ConfirmProfileError {
 }
 
 pub async fn confirm_profile(
-    deploy_data: &super::DeployData<'_>,
+    deploy_data: &super::DeployData,
     deploy_defs: &super::DeployDefs,
     temp_path: &Path,
     ssh_addr: &str,
@@ -313,7 +313,7 @@ pub async fn confirm_profile(
     let mut ssh_confirm_child = ssh_confirm_command
         .arg(confirm_command)
         .spawn()
-        .map_err(|err| ConfirmProfileError::SSHConfirm(command::CommandError::RunError(err)))?;
+        .map_err(|e| ConfirmProfileError::SSHConfirm(command::CommandError::RunError(e)))?;
 
     if deploy_data
         .merged_settings
@@ -388,7 +388,7 @@ pub enum DeployProfileError {
 }
 
 pub async fn deploy_profile(
-    deploy_data: &super::DeployData<'_>,
+    deploy_data: &super::DeployData,
     deploy_defs: &super::DeployDefs,
     dry_activate: bool,
     boot: bool,
@@ -422,7 +422,7 @@ pub async fn deploy_profile(
         confirm_timeout,
         magic_rollback,
         debug_logs: deploy_data.debug_logs,
-        log_dir: deploy_data.log_dir,
+        log_dir: deploy_data.log_dir.as_deref(),
         dry_activate,
         boot,
     });
@@ -501,7 +501,7 @@ pub async fn deploy_profile(
             temp_path,
             activation_timeout,
             debug_logs: deploy_data.debug_logs,
-            log_dir: deploy_data.log_dir,
+            log_dir: deploy_data.log_dir.as_deref(),
         });
 
         debug!("Constructed wait command: {}", self_wait_command);
@@ -653,7 +653,7 @@ pub enum RevokeProfileError {
     InvalidDeployDataDefs(#[from] DeployDataDefsError),
 }
 pub async fn revoke(
-    deploy_data: &crate::DeployData<'_>,
+    deploy_data: &crate::DeployData,
     deploy_defs: &crate::DeployDefs,
 ) -> Result<(), RevokeProfileError> {
     let self_revoke_command = build_revoke_command(&RevokeCommandData {
@@ -661,7 +661,7 @@ pub async fn revoke(
         closure: &deploy_data.profile.profile_settings.path,
         profile_info: deploy_data.get_profile_info()?,
         debug_logs: deploy_data.debug_logs,
-        log_dir: deploy_data.log_dir,
+        log_dir: deploy_data.log_dir.as_deref(),
     });
 
     debug!("Constructed revoke command: {}", self_revoke_command);

@@ -5,8 +5,11 @@
 
 use std::collections::HashMap;
 use std::io::{stdin, stdout, Write};
+use std::time::Duration;
 
 use clap::{ArgMatches, FromArgMatches, Parser};
+use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
+use tokio::join;
 
 use crate as deploy;
 use crate::command;
@@ -19,6 +22,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
+use tokio::task::JoinSet;
 
 /// Simple Rust rewrite of a simple Nix Flake deployment tool
 #[derive(Parser, Debug, Clone)]
@@ -369,7 +373,9 @@ fn prompt_deployment(
 
     if !yn::yes(&s) {
         if yn::is_somewhat_yes(&s) {
-            info!("Sounds like you might want to continue, to be more clear please just say \"yes\". Do you want to deploy these profiles?");
+            info!(
+                "Sounds like you might want to continue, to be more clear please just say \"yes\". Do you want to deploy these profiles?"
+            );
             print!("> ");
 
             stdout()
@@ -400,12 +406,12 @@ fn prompt_deployment(
 
 #[derive(Error, Debug)]
 pub enum RunDeployError {
-    #[error("Failed to deploy profile to node {0}: {1}")]
-    DeployProfile(String, deploy::deploy::DeployProfileError),
-    #[error("Failed to build profile on node {0}: {1}")]
-    BuildProfile(String, deploy::push::PushProfileError),
-    #[error("Failed to push profile to node {0}: {1}")]
-    PushProfile(String, deploy::push::PushProfileError),
+    #[error("Failed to deploy profile {0} to node {1}: {2}")]
+    DeployProfile(String, String, deploy::deploy::DeployProfileError),
+    #[error("Failed to build profile {0} on node {1}: {2}")]
+    BuildProfile(String, String, deploy::push::PushProfileError),
+    #[error("Failed to push profile {0} to node {1}: {2}")]
+    PushProfile(String, String, deploy::push::PushProfileError),
     #[error("No profile named `{0}` was found")]
     ProfileNotFound(String),
     #[error("No node named `{0}` was found")]
@@ -418,18 +424,22 @@ pub enum RunDeployError {
     TomlFormat(#[from] toml::ser::Error),
     #[error("{0}")]
     PromptDeployment(#[from] PromptDeploymentError),
-    #[error("Failed to revoke profile for node {0}: {1}")]
-    RevokeProfile(String, deploy::deploy::RevokeProfileError),
+    #[error("Failed to revoke profile {0} for node {1}: {2}")]
+    RevokeProfile(String, String, deploy::deploy::RevokeProfileError),
     #[error("Deployment to node {0} failed, rolled back to previous generation")]
     Rollback(String),
 }
 
 type ToDeploy<'a> = Vec<(
     &'a deploy::DeployFlake<'a>,
-    &'a deploy::data::Data,
+    deploy::data::Data,
     (&'a str, &'a deploy::data::Node),
     (&'a str, &'a deploy::data::Profile),
 )>;
+
+fn separator(_state: &ProgressState, w: &mut dyn std::fmt::Write) {
+    let _ = write!(w, "│");
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_deploy(
@@ -447,6 +457,7 @@ async fn run_deploy(
     boot: bool,
     log_dir: &Option<String>,
     rollback_succeeded: bool,
+    mp: MultiProgress,
 ) -> Result<(), RunDeployError> {
     let to_deploy: ToDeploy = deploy_flakes
         .iter()
@@ -465,7 +476,7 @@ async fn run_deploy(
 
                     vec![(
                         deploy_flake,
-                        data,
+                        data.clone(),
                         (node_name.as_str(), node),
                         (profile_name.as_str(), profile),
                     )]
@@ -487,7 +498,7 @@ async fn run_deploy(
                         let profile = match node.node_settings.profiles.get(profile_name) {
                             Some(x) => x,
                             None => {
-                                return Err(RunDeployError::ProfileNotFound(profile_name.clone()))
+                                return Err(RunDeployError::ProfileNotFound(profile_name.clone()));
                             }
                         };
 
@@ -498,7 +509,7 @@ async fn run_deploy(
 
                     profiles_list
                         .into_iter()
-                        .map(|x| (deploy_flake, data, (node_name.as_str(), node), x))
+                        .map(|x| (deploy_flake, data.clone(), (node_name.as_str(), node), x))
                         .collect()
                 }
                 (None, None) => {
@@ -518,7 +529,7 @@ async fn run_deploy(
                                 None => {
                                     return Err(RunDeployError::ProfileNotFound(
                                         profile_name.clone(),
-                                    ))
+                                    ));
                                 }
                             };
 
@@ -529,7 +540,7 @@ async fn run_deploy(
 
                         let ll: ToDeploy = profiles_list
                             .into_iter()
-                            .map(|x| (deploy_flake, data, (node_name.as_str(), node), x))
+                            .map(|x| (deploy_flake, data.clone(), (node_name.as_str(), node), x))
                             .collect();
 
                         l.extend(ll);
@@ -556,12 +567,12 @@ async fn run_deploy(
         let deploy_data = deploy::make_deploy_data(
             &data.generic_settings,
             node,
-            node_name,
+            node_name.to_string(),
             profile,
-            profile_name,
+            profile_name.to_string(),
             cmd_overrides,
             debug_logs,
-            log_dir.as_deref(),
+            log_dir.clone(),
         );
 
         let mut deploy_defs = deploy_data.defs()?;
@@ -571,10 +582,14 @@ async fn run_deploy(
             .interactive_sudo
             .unwrap_or(false)
         {
-            warn!("Interactive sudo is enabled! Using a sudo password is less secure than correctly configured SSH keys.\nPlease use keys in production environments.");
+            warn!(
+                "Interactive sudo is enabled! Using a sudo password is less secure than correctly configured SSH keys.\nPlease use keys in production environments."
+            );
 
             if deploy_data.merged_settings.sudo.is_some() {
-                warn!("Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' option. Deployment may fail if the custom command ignores stdin.");
+                warn!(
+                    "Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' option. Deployment may fail if the custom command ignores stdin."
+                );
             } else {
                 // this configures sudo to hide the password prompt and accept input from stdin
                 // at the time of writing, deploy_defs.sudo defaults to 'sudo -u root' when using user=root and sshUser as non-root
@@ -609,36 +624,189 @@ async fn run_deploy(
             |(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
                 supports_flakes,
                 check_sigs,
-                repo: deploy_flake.repo,
-                deploy_data,
-                deploy_defs,
+                repo: deploy_flake.repo.to_string(),
+                deploy_data: deploy_data.clone(),
+                deploy_defs: deploy_defs.clone(),
                 keep_result,
-                result_path,
-                extra_build_args,
+                result_path: result_path.map(str::to_string),
+                extra_build_args: extra_build_args.to_vec(),
             },
         )
     };
 
-    for data in data_iter() {
-        let node_name: String = data.deploy_data.node_name.to_string();
-        deploy::push::build_profile(data)
-            .await
-            .map_err(|e| RunDeployError::BuildProfile(node_name, e))?;
+    let (remote_builds, local_builds): (Vec<_>, Vec<_>) = data_iter().partition(|data| {
+        data.deploy_data
+            .merged_settings
+            .remote_build
+            .unwrap_or_default()
+    });
+
+    // the grouping by host will retain each hosts ordering by profiles_order since the fold is synchronous
+    let remote_build_map: HashMap<_, Vec<_>> =
+        remote_builds
+            .into_iter()
+            .fold(HashMap::new(), |mut accum, elem| {
+                match accum.get_mut(&elem.deploy_data.node_name) {
+                    Some(v) => {
+                        v.push(elem);
+                        accum
+                    }
+                    None => {
+                        accum.insert(elem.deploy_data.node_name.clone(), vec![elem]);
+                        accum
+                    }
+                }
+            });
+
+    // show progress information
+    let remote_mp = mp.clone();
+    let spinner_style = ProgressStyle::with_template("{spinner:.blue} {prefix} {sep:.blue} {msg}")
+        .expect("invalid template")
+        .with_key("sep", separator)
+        .tick_strings(&["⢎ ", "⠎⠁", "⠊⠑", "⠈⠱", " ⡱", "⢀⡰", "⢄⡠", "⢆⡀"]);
+    let finish_style = || {
+        ProgressStyle::with_template("✅ {prefix} {sep:.blue} {msg}")
+            .expect("invalid template")
+            .with_key("sep", separator)
+    };
+    let finish_style_error = || {
+        ProgressStyle::with_template("❌ {prefix} {sep:.blue} {msg}")
+            .expect("invalid template")
+            .with_key("sep", separator)
+    };
+    let new_spinner = || ProgressBar::new_spinner().with_style(spinner_style.clone());
+
+    let (remote_results, local_results) = join!(
+        // remote builds can be run asynchronously
+        async move {
+            let mut set = JoinSet::new();
+
+            #[allow(clippy::iter_kv_map)]
+            for (_, profiles) in remote_build_map {
+                // spawn one future for each host
+                let pb = remote_mp.add(new_spinner());
+                pb.enable_steady_tick(Duration::from_millis(80));
+
+                set.spawn(async move {
+                    let mut res = Ok(());
+
+                    // build profile in order, one after the other
+                    for mut profile in profiles {
+                        let nodename = profile.deploy_data.node_name.clone();
+                        let profilename = profile.deploy_data.profile_name.clone();
+                        pb.set_prefix(format!(
+                            "Building profile '{}' on host '{}'",
+                            profilename, nodename
+                        ));
+                        pb.set_message("...");
+                        profile.deploy_data.progressbar = Some(pb.clone());
+
+                        info!(
+                            "starting build of profile {} on node {}",
+                            profilename, nodename
+                        );
+
+                        res = deploy::push::build_profile(&profile).await.map_err(|e| {
+                            RunDeployError::BuildProfile(
+                                profilename.to_string(),
+                                nodename.to_string(),
+                                e,
+                            )
+                        });
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+
+                    match res {
+                        Ok(()) => {
+                            pb.set_style(finish_style());
+                            pb.finish_with_message("Done!");
+                        }
+                        Err(ref e) => {
+                            pb.set_style(finish_style_error());
+                            pb.finish_with_message(format!("Error: {}", e))
+                        }
+                    }
+
+                    res
+                });
+            }
+
+            set.join_all().await
+        },
+        // run local builds synchronously to prevent hardware deadlocks
+        async move {
+            let mut set = JoinSet::new();
+
+            for mut data in local_builds.into_iter() {
+                let pb = mp.add(new_spinner());
+                pb.enable_steady_tick(Duration::from_millis(80));
+
+                let node_name = data.deploy_data.node_name.to_string();
+                let profile_name = data.deploy_data.profile_name.to_string();
+                pb.set_prefix(format!(
+                    "Building profile '{}' for host '{}'",
+                    profile_name, node_name
+                ));
+                pb.set_message("...");
+                data.deploy_data.progressbar = Some(pb.clone());
+
+                let res = deploy::push::build_profile(&data).await.map_err(|e| {
+                    RunDeployError::BuildProfile(profile_name.clone(), node_name.clone(), e)
+                });
+
+                match res {
+                    Ok(()) => {
+                        set.spawn(async move {
+                            let data = data.clone();
+                            pb.set_prefix(format!(
+                                "Pushing profile '{}' to host '{}'",
+                                profile_name, node_name
+                            ));
+                            let res = deploy::push::push_profile(&data).await.map_err(|e| {
+                                RunDeployError::PushProfile(profile_name, node_name, e)
+                            });
+                            match res {
+                                Ok(()) => {
+                                    pb.set_style(finish_style());
+                                    pb.finish_with_message("Done!");
+                                }
+                                Err(ref e) => {
+                                    pb.set_style(finish_style_error());
+                                    pb.finish_with_message(format!("Error: {}", e))
+                                }
+                            }
+                            res
+                        });
+                    }
+                    Err(ref e) => {
+                        pb.set_style(finish_style_error());
+                        pb.finish_with_message(format!("Error: {}", e));
+                        // "spawn" a future that just returns the error when building locally fails
+                        // this will ensure that the deployment is actually aborted in the error
+                        // handling code below
+                        set.spawn(async move { res });
+                    }
+                }
+            }
+            set.join_all().await
+        }
+    );
+
+    // abort here if any build + push or push + build failed
+    for result in remote_results {
+        result?
+    }
+    for result in local_results {
+        result?
     }
 
-    for data in data_iter() {
-        let node_name: String = data.deploy_data.node_name.to_string();
-        deploy::push::push_profile(data)
-            .await
-            .map_err(|e| RunDeployError::PushProfile(node_name, e))?;
-    }
-
-    let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];
-
-    // Run all deployments
-    // In case of an error rollback any previoulsy made deployment.
+    // Run all activations
+    // In case of an error, rollback any previoulsy made deployment.
     // Rollbacks adhere to the global seeting to auto_rollback and secondary
     // the profile's configuration
+    let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];
     for (_, deploy_data, deploy_defs) in &parts {
         if let Err(e) =
             deploy::deploy::deploy_profile(deploy_data, deploy_defs, dry_activate, boot).await
@@ -657,13 +825,18 @@ async fn run_deploy(
                         deploy::deploy::revoke(deploy_data, deploy_defs)
                             .await
                             .map_err(|e| {
-                                RunDeployError::RevokeProfile(deploy_data.node_name.to_string(), e)
+                                RunDeployError::RevokeProfile(
+                                    deploy_data.profile_name.to_string(),
+                                    deploy_data.node_name.to_string(),
+                                    e,
+                                )
                             })?;
                     }
                 }
                 return Err(RunDeployError::Rollback(deploy_data.node_name.to_string()));
             }
             return Err(RunDeployError::DeployProfile(
+                deploy_data.profile_name.to_string(),
                 deploy_data.node_name.to_string(),
                 e,
             ));
@@ -702,7 +875,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         None => Opts::parse(),
     };
 
-    deploy::init_logger(
+    let (mp, _handle) = deploy::init_logger(
         opts.debug_logs,
         opts.log_dir.as_deref(),
         &deploy::LoggerType::Deploy,
@@ -750,7 +923,9 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
     let do_not_want_flakes = opts.file.is_some();
 
     if !supports_flakes {
-        warn!("A Nix version without flakes support was detected, support for this is work in progress");
+        warn!(
+            "A Nix version without flakes support was detected, support for this is work in progress"
+        );
     }
 
     if do_not_want_flakes {
@@ -781,6 +956,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         opts.boot,
         &opts.log_dir,
         opts.rollback_succeeded.unwrap_or(true),
+        mp,
     )
     .await?;
 

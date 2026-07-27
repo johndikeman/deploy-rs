@@ -8,7 +8,7 @@ use std::io::{stdin, stdout, Write};
 use std::time::Duration;
 
 use clap::{ArgMatches, FromArgMatches, Parser};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use tokio::join;
 
 use crate as deploy;
@@ -373,7 +373,9 @@ fn prompt_deployment(
 
     if !yn::yes(&s) {
         if yn::is_somewhat_yes(&s) {
-            info!("Sounds like you might want to continue, to be more clear please just say \"yes\". Do you want to deploy these profiles?");
+            info!(
+                "Sounds like you might want to continue, to be more clear please just say \"yes\". Do you want to deploy these profiles?"
+            );
             print!("> ");
 
             stdout()
@@ -435,6 +437,10 @@ type ToDeploy<'a> = Vec<(
     (&'a str, &'a deploy::data::Profile),
 )>;
 
+fn separator(_state: &ProgressState, w: &mut dyn std::fmt::Write) {
+    let _ = write!(w, "│");
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_deploy(
     deploy_flakes: Vec<deploy::DeployFlake<'_>>,
@@ -492,7 +498,7 @@ async fn run_deploy(
                         let profile = match node.node_settings.profiles.get(profile_name) {
                             Some(x) => x,
                             None => {
-                                return Err(RunDeployError::ProfileNotFound(profile_name.clone()))
+                                return Err(RunDeployError::ProfileNotFound(profile_name.clone()));
                             }
                         };
 
@@ -523,7 +529,7 @@ async fn run_deploy(
                                 None => {
                                     return Err(RunDeployError::ProfileNotFound(
                                         profile_name.clone(),
-                                    ))
+                                    ));
                                 }
                             };
 
@@ -576,10 +582,14 @@ async fn run_deploy(
             .interactive_sudo
             .unwrap_or(false)
         {
-            warn!("Interactive sudo is enabled! Using a sudo password is less secure than correctly configured SSH keys.\nPlease use keys in production environments.");
+            warn!(
+                "Interactive sudo is enabled! Using a sudo password is less secure than correctly configured SSH keys.\nPlease use keys in production environments."
+            );
 
             if deploy_data.merged_settings.sudo.is_some() {
-                warn!("Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' option. Deployment may fail if the custom command ignores stdin.");
+                warn!(
+                    "Custom sudo commands should be configured to accept password input from stdin when using the 'interactive sudo' option. Deployment may fail if the custom command ignores stdin."
+                );
             } else {
                 // this configures sudo to hide the password prompt and accept input from stdin
                 // at the time of writing, deploy_defs.sudo defaults to 'sudo -u root' when using user=root and sshUser as non-root
@@ -650,13 +660,20 @@ async fn run_deploy(
 
     // show progress information
     let remote_mp = mp.clone();
-    let spinner_style = ProgressStyle::with_template("{spinner:.blue} {prefix} {msg}")
+    let spinner_style = ProgressStyle::with_template("{spinner:.blue} {prefix} {sep:.blue} {msg}")
         .expect("invalid template")
+        .with_key("sep", separator)
         .tick_strings(&["⢎ ", "⠎⠁", "⠊⠑", "⠈⠱", " ⡱", "⢀⡰", "⢄⡠", "⢆⡀"]);
-    let finish_style =
-        || ProgressStyle::with_template("✅ {prefix} {msg}").expect("invalid template");
-    let finish_style_error =
-        || ProgressStyle::with_template("❌ {prefix} {msg}").expect("invalid template");
+    let finish_style = || {
+        ProgressStyle::with_template("✅ {prefix} {sep:.blue} {msg}")
+            .expect("invalid template")
+            .with_key("sep", separator)
+    };
+    let finish_style_error = || {
+        ProgressStyle::with_template("❌ {prefix} {sep:.blue} {msg}")
+            .expect("invalid template")
+            .with_key("sep", separator)
+    };
     let new_spinner = || ProgressBar::new_spinner().with_style(spinner_style.clone());
 
     let (remote_results, local_results) = join!(
@@ -732,6 +749,8 @@ async fn run_deploy(
                     "Building profile '{}' for host '{}'",
                     profile_name, node_name
                 ));
+                pb.set_message("...");
+                data.deploy_data.progressbar = Some(pb.clone());
 
                 let res = deploy::push::build_profile(&data).await.map_err(|e| {
                     RunDeployError::BuildProfile(profile_name.clone(), node_name.clone(), e)
@@ -739,7 +758,6 @@ async fn run_deploy(
 
                 match res {
                     Ok(()) => {
-                        data.deploy_data.progressbar = Some(pb.clone());
                         set.spawn(async move {
                             let data = data.clone();
                             pb.set_prefix(format!(
@@ -905,7 +923,9 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
     let do_not_want_flakes = opts.file.is_some();
 
     if !supports_flakes {
-        warn!("A Nix version without flakes support was detected, support for this is work in progress");
+        warn!(
+            "A Nix version without flakes support was detected, support for this is work in progress"
+        );
     }
 
     if do_not_want_flakes {

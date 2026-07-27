@@ -4,6 +4,7 @@
 
 use indicatif::ProgressBar;
 use log::{debug, info, warn};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use thiserror::Error;
@@ -91,8 +92,10 @@ pub enum PushProfileError {
              Did you forget to use deploy-rs#lib.<...>.activate.<...> on your profile path?"
     )]
     DeployRsActivateDoesntExist,
-    #[error("Activation script activate-rs does not exist in profile.\n\
-             Is there a mismatch in deploy-rs used in the flake you're deploying and deploy-rs command you're running?")]
+    #[error(
+        "Activation script activate-rs does not exist in profile.\n\
+             Is there a mismatch in deploy-rs used in the flake you're deploying and deploy-rs command you're running?"
+    )]
     ActivateRsDoesntExist,
 }
 
@@ -151,10 +154,32 @@ pub async fn build_profile_locally(
         // Logging should be in stderr, this just stops the store path from printing for no reason
         .stdout(Stdio::null());
 
-    let build_status = command::Command::new(build_command)
-        .status()
-        .await
-        .map_err(PushProfileError::Build)?;
+    debug!("build command: {:?}", build_command);
+
+    // When a progress bar is attached, pipe nix's stderr and route each line
+    // through the spinner's message. Otherwise nix detects the terminal and
+    // draws its own `[x/y built]` bar directly, which corrupts the display.
+    let build_status = if let Some(pb) = &data.deploy_data.progressbar {
+        // `internal-json` gives us structured progress to render in the spinner
+        // instead of nix's own (terminal-drawing) progress bar.
+        build_command.arg("--log-format").arg("internal-json");
+        let mut child = build_command
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
+
+        update_pb_with_child_output(pb, &mut child).await;
+
+        child
+            .wait()
+            .await
+            .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?
+    } else {
+        command::Command::new(build_command)
+            .status()
+            .await
+            .map_err(PushProfileError::Build)?
+    };
 
     match build_status.code() {
         Some(0) => (),
@@ -206,22 +231,193 @@ pub async fn build_profile_locally(
     Ok(())
 }
 
+// Nix `internal-json` activity types (see nix's `logging.hh`).
+const ACT_COPY_PATHS: i64 = 103;
+const ACT_BUILDS: i64 = 104;
+const ACT_FILE_TRANSFER: i64 = 101;
+// Result types.
+const RES_PROGRESS: i64 = 105;
+const RES_BUILD_LOG_LINE: i64 = 101;
+
+/// Accumulates the aggregate progress reported by `nix --log-format internal-json`
+/// so we can render a compact `x/y built, x/y copied` message next to the spinner,
+/// mirroring nix's own progress bar.
+#[derive(Default)]
+struct NixProgress {
+    // Map of activity id -> activity type, so `result` events can be attributed.
+    activities: HashMap<u64, i64>,
+    builds: (u64, u64),
+    copies: (u64, u64),
+    // Downloads are not an aggregate activity: each file transfer reports its
+    // own byte count, so we track the latest bytes per active transfer and keep
+    // a running total of finished ones to render a single `X MiB DL` figure.
+    download_active: HashMap<u64, u64>,
+    download_done: u64,
+    // The most recent human-readable activity text (current path, build log line, ...).
+    last_line: String,
+}
+
+/// Render a byte count the way nix's own progress bar does (KiB/MiB/GiB, base 1024).
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", n, UNITS[unit])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
+}
+
+impl NixProgress {
+    /// Ingest one line of child output. Returns `true` if it was a structured
+    /// `@nix` message (already handled), `false` if it is a plain log line the
+    /// caller should surface directly.
+    fn ingest(&mut self, line: &str) -> bool {
+        let json = match line.strip_prefix("@nix ") {
+            Some(json) => json,
+            None => return false,
+        };
+        let value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+
+        let action = value.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        match action {
+            "start" => {
+                let id = value.get("id").and_then(serde_json::Value::as_u64);
+                let typ = value.get("type").and_then(serde_json::Value::as_i64);
+                if let (Some(id), Some(typ)) = (id, typ) {
+                    self.activities.insert(id, typ);
+                }
+                // Show the individual operation (copying/downloading/building '...').
+                if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+                    if !text.is_empty() {
+                        self.last_line = text.to_string();
+                    }
+                }
+            }
+            "stop" => {
+                if let Some(id) = value.get("id").and_then(serde_json::Value::as_u64) {
+                    // Fold a finished download's bytes into the running total.
+                    if let Some(bytes) = self.download_active.remove(&id) {
+                        self.download_done += bytes;
+                    }
+                    self.activities.remove(&id);
+                }
+            }
+            "result" => {
+                let id = value.get("id").and_then(serde_json::Value::as_u64);
+                let rtype = value.get("type").and_then(serde_json::Value::as_i64);
+                let fields = value.get("fields").and_then(serde_json::Value::as_array);
+                match rtype {
+                    // Progress on an aggregate activity: fields = [done, expected, running, failed].
+                    Some(RES_PROGRESS) => {
+                        if let (Some(&atype), Some(fields)) =
+                            (id.and_then(|id| self.activities.get(&id)), fields)
+                        {
+                            let done = fields.first().and_then(serde_json::Value::as_u64);
+                            let expected = fields.get(1).and_then(serde_json::Value::as_u64);
+                            match atype {
+                                ACT_BUILDS => {
+                                    if let (Some(done), Some(expected)) = (done, expected) {
+                                        self.builds = (done, expected);
+                                    }
+                                }
+                                ACT_COPY_PATHS => {
+                                    if let (Some(done), Some(expected)) = (done, expected) {
+                                        self.copies = (done, expected);
+                                    }
+                                }
+                                // fields[0] is this transfer's downloaded bytes.
+                                ACT_FILE_TRANSFER => {
+                                    if let (Some(id), Some(done)) = (id, done) {
+                                        self.download_active.insert(id, done);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // A line of build output from a running derivation.
+                    Some(RES_BUILD_LOG_LINE) => {
+                        if let Some(text) = fields
+                            .and_then(|f| f.first())
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            if !text.is_empty() {
+                                self.last_line = text.to_string();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Render the accumulated state into a spinner message.
+    fn message(&self) -> String {
+        let mut counts = Vec::new();
+        if self.builds.1 > 0 {
+            counts.push(format!("{}/{} built", self.builds.0, self.builds.1));
+        }
+        if self.copies.1 > 0 {
+            counts.push(format!("{}/{} copied", self.copies.0, self.copies.1));
+        }
+        let downloaded: u64 = self.download_done + self.download_active.values().sum::<u64>();
+        if downloaded > 0 {
+            counts.push(format!("{} DL", human_bytes(downloaded)));
+        }
+        let counts = counts.join(", ");
+
+        match (counts.is_empty(), self.last_line.is_empty()) {
+            (false, false) => format!("[{}] {}", counts, self.last_line),
+            (false, true) => counts,
+            (true, false) => self.last_line.clone(),
+            (true, true) => "...".to_string(),
+        }
+    }
+}
+
 async fn update_pb_with_child_output(pb: &ProgressBar, child: &mut Child) {
+    // Only follow the streams that were actually piped. Some callers null out
+    // stdout (e.g. local builds, where nix prints the store path there), so we
+    // must not assume both handles are present.
     let stdout = child
         .stdout
         .take()
-        .expect("child did not have a stdout handle");
+        .map(|out| LinesStream::new(BufReader::new(out).lines()));
     let stderr = child
         .stderr
         .take()
-        .expect("child did not have a stderr handle");
+        .map(|err| LinesStream::new(BufReader::new(err).lines()));
 
-    let stdout = LinesStream::new(BufReader::new(stdout).lines());
-    let stderr = LinesStream::new(BufReader::new(stderr).lines());
-    let mut merged = StreamExt::merge(stdout, stderr);
+    let mut merged = match (stdout, stderr) {
+        (Some(out), Some(err)) => Box::pin(StreamExt::merge(out, err))
+            as std::pin::Pin<Box<dyn tokio_stream::Stream<Item = _> + Send>>,
+        (Some(out), None) => Box::pin(out),
+        (None, Some(err)) => Box::pin(err),
+        (None, None) => return,
+    };
 
+    let mut progress = NixProgress::default();
     while let Some(line) = merged.next().await {
-        pb.set_message(line.expect("expected a valid line"));
+        let line = line.expect("expected a valid line");
+        // Structured `@nix` events feed the aggregate counters; anything else
+        // (e.g. a stray warning) is shown verbatim.
+        if progress.ingest(&line) {
+            pb.set_message(progress.message());
+        } else if !line.is_empty() {
+            pb.set_message(line);
+        }
     }
 }
 
@@ -254,6 +450,10 @@ pub async fn build_profile_remotely(
             .arg("--derivation")
             .arg(derivation_name)
             .env("NIX_SSHOPTS", ssh_opts_str.clone());
+
+        if data.deploy_data.progressbar.is_some() {
+            copy_command.arg("--log-format").arg("internal-json");
+        }
 
         debug!("copy command: {:?}", copy_command);
 
@@ -289,6 +489,10 @@ pub async fn build_profile_remotely(
             .arg(&store_address)
             .args(data.extra_build_args.clone())
             .env("NIX_SSHOPTS", ssh_opts_str.clone());
+
+        if data.deploy_data.progressbar.is_some() {
+            build_command.arg("--log-format").arg("internal-json");
+        }
 
         debug!("build command: {:?}", build_command);
 
@@ -341,7 +545,7 @@ pub async fn build_profile(data: &PushProfileData) -> Result<(), PushProfileErro
         _exit_code => {
             return Err(PushProfileError::ShowDerivation(
                 command::CommandError::Exit(show_derivation_output, show_derivation_command_str),
-            ))
+            ));
         }
     };
 
@@ -487,10 +691,35 @@ pub async fn push_profile(data: &PushProfileData) -> Result<(), PushProfileError
             .arg(format!("ssh://{}@{}", data.deploy_defs.ssh_user, hostname))
             .arg(&data.deploy_data.profile.profile_settings.path)
             .env("NIX_SSHOPTS", ssh_opts_str);
-        command::Command::new(copy_command)
-            .status()
+
+        if data.deploy_data.progressbar.is_some() {
+            copy_command.arg("--log-format").arg("internal-json");
+        }
+
+        debug!("copy command: {:?}", copy_command);
+
+        // Pipe the output so nix does not draw directly to the terminal (which
+        // corrupts the progress bars); instead route each line through the
+        // spinner's message via `update_pb_with_child_output`.
+        let mut child = copy_command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn nix copy command");
+
+        if let Some(pb) = &data.deploy_data.progressbar {
+            update_pb_with_child_output(pb, &mut child).await;
+        }
+
+        let copy_exit_status = child
+            .wait()
             .await
-            .map_err(PushProfileError::Copy)?;
+            .map_err(|e| PushProfileError::Copy(command::CommandError::RunError(e)))?;
+
+        match copy_exit_status.code() {
+            Some(0) => (),
+            a => return Err(PushProfileError::CopyExit(a)),
+        };
     }
 
     Ok(())

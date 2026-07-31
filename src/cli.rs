@@ -662,6 +662,12 @@ async fn run_deploy(
                 }
             });
 
+    // Progress bars only used when building on more than one remote host at once.
+    // For a purely local build, or a single remote host, there is no concurrency,
+    // so we let nix write its native output (native `-L`, errors and progress)
+    // directly to the terminal instead.
+    let use_progress = remote_build_map.len() > 1;
+
     // show progress information
     let remote_mp = mp.clone();
     let spinner_style = ProgressStyle::with_template("{spinner:.blue} {prefix} {sep:.blue} {msg}")
@@ -688,8 +694,13 @@ async fn run_deploy(
             #[allow(clippy::iter_kv_map)]
             for (_, profiles) in remote_build_map {
                 // spawn one future for each host
-                let pb = remote_mp.add(new_spinner());
-                pb.enable_steady_tick(Duration::from_millis(80));
+                let pb = if use_progress {
+                    let pb = remote_mp.add(new_spinner());
+                    pb.enable_steady_tick(Duration::from_millis(80));
+                    Some(pb)
+                } else {
+                    None
+                };
 
                 set.spawn(async move {
                     let mut res = Ok(());
@@ -698,12 +709,14 @@ async fn run_deploy(
                     for mut profile in profiles {
                         let nodename = profile.deploy_data.node_name.clone();
                         let profilename = profile.deploy_data.profile_name.clone();
-                        pb.set_prefix(format!(
-                            "Building profile '{}' on host '{}'",
-                            profilename, nodename
-                        ));
-                        pb.set_message("...");
-                        profile.deploy_data.progressbar = Some(pb.clone());
+                        if let Some(pb) = &pb {
+                            pb.set_prefix(format!(
+                                "Building profile '{}' on host '{}'",
+                                profilename, nodename
+                            ));
+                            pb.set_message("...");
+                            profile.deploy_data.progressbar = Some(pb.clone());
+                        }
 
                         info!(
                             "starting build of profile {} on node {}",
@@ -722,14 +735,16 @@ async fn run_deploy(
                         }
                     }
 
-                    match res {
-                        Ok(()) => {
-                            pb.set_style(finish_style());
-                            pb.finish_with_message("Done!");
-                        }
-                        Err(ref e) => {
-                            pb.set_style(finish_style_error());
-                            pb.finish_with_message(format!("Error: {}", e))
+                    if let Some(pb) = &pb {
+                        match res {
+                            Ok(()) => {
+                                pb.set_style(finish_style());
+                                pb.finish_with_message("Done!");
+                            }
+                            Err(ref e) => {
+                                pb.set_style(finish_style_error());
+                                pb.finish_with_message(format!("Error: {}", e));
+                            }
                         }
                     }
 
@@ -744,17 +759,28 @@ async fn run_deploy(
             let mut set = JoinSet::new();
 
             for mut data in local_builds.into_iter() {
-                let pb = mp.add(new_spinner());
-                pb.enable_steady_tick(Duration::from_millis(80));
-
                 let node_name = data.deploy_data.node_name.to_string();
                 let profile_name = data.deploy_data.profile_name.to_string();
-                pb.set_prefix(format!(
-                    "Building profile '{}' for host '{}'",
-                    profile_name, node_name
-                ));
-                pb.set_message("...");
-                data.deploy_data.progressbar = Some(pb.clone());
+
+                // Only render a spinner when we have to coordinate with the
+                // concurrent remote builds; otherwise let nix output natively.
+                let pb = if use_progress {
+                    let pb = mp.add(new_spinner());
+                    pb.enable_steady_tick(Duration::from_millis(80));
+                    pb.set_prefix(format!(
+                        "Building profile '{}' for host '{}'",
+                        profile_name, node_name
+                    ));
+                    pb.set_message("...");
+                    data.deploy_data.progressbar = Some(pb.clone());
+                    Some(pb)
+                } else {
+                    info!(
+                        "Building profile `{}` for node `{}`",
+                        profile_name, node_name
+                    );
+                    None
+                };
 
                 let res = deploy::push::build_profile(&data).await.map_err(|e| {
                     RunDeployError::BuildProfile(profile_name.clone(), node_name.clone(), e)
@@ -764,29 +790,35 @@ async fn run_deploy(
                     Ok(()) => {
                         set.spawn(async move {
                             let data = data.clone();
-                            pb.set_prefix(format!(
-                                "Pushing profile '{}' to host '{}'",
-                                profile_name, node_name
-                            ));
+                            if let Some(pb) = &pb {
+                                pb.set_prefix(format!(
+                                    "Pushing profile '{}' to host '{}'",
+                                    profile_name, node_name
+                                ));
+                            }
                             let res = deploy::push::push_profile(&data).await.map_err(|e| {
                                 RunDeployError::PushProfile(profile_name, node_name, e)
                             });
-                            match res {
-                                Ok(()) => {
-                                    pb.set_style(finish_style());
-                                    pb.finish_with_message("Done!");
-                                }
-                                Err(ref e) => {
-                                    pb.set_style(finish_style_error());
-                                    pb.finish_with_message(format!("Error: {}", e))
+                            if let Some(pb) = &pb {
+                                match res {
+                                    Ok(()) => {
+                                        pb.set_style(finish_style());
+                                        pb.finish_with_message("Done!");
+                                    }
+                                    Err(ref e) => {
+                                        pb.set_style(finish_style_error());
+                                        pb.finish_with_message(format!("Error: {}", e));
+                                    }
                                 }
                             }
                             res
                         });
                     }
                     Err(ref e) => {
-                        pb.set_style(finish_style_error());
-                        pb.finish_with_message(format!("Error: {}", e));
+                        if let Some(pb) = &pb {
+                            pb.set_style(finish_style_error());
+                            pb.finish_with_message(format!("Error: {}", e));
+                        }
                         // "spawn" a future that just returns the error when building locally fails
                         // this will ensure that the deployment is actually aborted in the error
                         // handling code below

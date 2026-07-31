@@ -232,12 +232,13 @@ pub async fn build_profile_locally(
 }
 
 // Nix `internal-json` activity types (see nix's `logging.hh`).
+const ACT_FILE_TRANSFER: i64 = 101;
 const ACT_COPY_PATHS: i64 = 103;
 const ACT_BUILDS: i64 = 104;
-const ACT_FILE_TRANSFER: i64 = 101;
-// Result types.
-const RES_PROGRESS: i64 = 105;
 const RES_BUILD_LOG_LINE: i64 = 101;
+const RES_PROGRESS: i64 = 105;
+// Nix verbosity levels: 0 = error, 1 = warning (higher = notice/info/debug).
+const LVL_WARN: i64 = 1;
 
 /// Accumulates the aggregate progress reported by `nix --log-format internal-json`
 /// so we can render a compact `x/y built, x/y copied` message next to the spinner,
@@ -254,6 +255,9 @@ struct NixProgress {
     // a running total of finished ones to render a single `X MiB DL` figure.
     download_active: HashMap<u64, u64>,
     download_done: u64,
+    // An error/warning message from the last ingested event, always surfaced so
+    // failures aren't reduced to a bare exit code.
+    pending_msg: Option<String>,
     // The most recent human-readable activity text (current path, build log line, ...).
     last_line: String,
 }
@@ -360,6 +364,21 @@ impl NixProgress {
                     _ => {}
                 }
             }
+            // Errors and warnings: always surfaced (independent of `-L`) so a
+            // failed build shows its reason instead of a bare exit code.
+            "msg" => {
+                let level = value
+                    .get("level")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(i64::MAX);
+                if level <= LVL_WARN {
+                    if let Some(msg) = value.get("msg").and_then(serde_json::Value::as_str) {
+                        if !msg.is_empty() {
+                            self.pending_msg = Some(msg.to_string());
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         true
@@ -416,6 +435,10 @@ async fn update_pb_with_child_output(pb: &ProgressBar, child: &mut Child) {
         // Structured `@nix` events feed the aggregate counters; anything else
         // (e.g. a stray warning) is shown verbatim.
         if progress.ingest(&line) {
+            // Errors/warnings are always surfaced above the bar.
+            if let Some(msg) = progress.pending_msg.take() {
+                pb.println(msg);
+            }
             pb.set_message(progress.message());
         } else if !line.is_empty() {
             pb.set_message(line);

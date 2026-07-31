@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use merge::Merge;
+use serde::de::Deserializer;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 #[derive(Deserialize, Debug, Clone, Merge)]
@@ -37,6 +38,40 @@ pub struct GenericSettings {
     pub remote_build: Option<bool>,
     #[serde(rename(deserialize = "interactiveSudo"))]
     pub interactive_sudo: Option<bool>,
+    #[serde(
+        default,
+        rename(deserialize = "groups"),
+        deserialize_with = "deserialize_groups"
+    )]
+    #[merge(strategy = merge_groups)]
+    pub groups: BTreeSet<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StringOrVec {
+    String(String),
+    Vec(Vec<String>),
+}
+
+fn deserialize_groups<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<StringOrVec>::deserialize(deserializer)?;
+    Ok(match value {
+        None => BTreeSet::new(),
+        Some(StringOrVec::String(s)) => {
+            let mut set = BTreeSet::new();
+            set.insert(s);
+            set
+        }
+        Some(StringOrVec::Vec(v)) => v.into_iter().collect(),
+    })
+}
+
+fn merge_groups(left: &mut BTreeSet<String>, right: BTreeSet<String>) {
+    left.extend(right);
 }
 
 #[derive(Deserialize, Debug, Clone)]

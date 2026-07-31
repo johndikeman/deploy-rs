@@ -79,6 +79,9 @@ pub struct Opts {
     /// Override the SSH options used
     #[arg(long, allow_hyphen_values = true)]
     ssh_opts: Option<String>,
+    /// Filter profiles by group (merged from profile/node/deploy)
+    #[arg(long, num_args = 1..)]
+    groups: Option<Vec<String>>,
     /// Override if the connecting to the target node should be considered fast
     #[arg(long)]
     fast_connection: Option<bool>,
@@ -579,6 +582,17 @@ async fn run_deploy(
             log_dir.clone(),
         );
 
+        if let Some(ref groups) = cmd_overrides.groups {
+            if !deploy_data
+                .merged_settings
+                .groups
+                .iter()
+                .any(|g| groups.contains(g))
+            {
+                continue;
+            }
+        }
+
         let mut deploy_defs = deploy_data.defs()?;
 
         if deploy_data
@@ -615,6 +629,11 @@ async fn run_deploy(
         }
 
         parts.push((deploy_flake, deploy_data, deploy_defs));
+    }
+
+    if parts.is_empty() {
+        info!("No profiles matched selection.");
+        return Ok(());
     }
 
     if interactive {
@@ -906,6 +925,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         ssh_user: opts.ssh_user,
         profile_user: opts.profile_user,
         ssh_opts: opts.ssh_opts,
+        groups: opts.groups,
         fast_connection: opts.fast_connection,
         auto_rollback: opts.auto_rollback,
         hostname: opts.hostname,

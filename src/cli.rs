@@ -463,6 +463,14 @@ type ToDeploy<'a> = Vec<(
     (&'a str, &'a deploy::data::Profile),
 )>;
 
+// (node_name, profile_name, closure) for a profile that finished building.
+type BuiltProfile = (String, String, String);
+// Per-host build results from the async remote-build pipeline: one Vec of
+// BuiltProfile per host (built in order), or an error if that host's build failed.
+type RemoteBuildResults = Vec<Result<Vec<BuiltProfile>, RunDeployError>>;
+// Per-profile build+push results from the async local-build pipeline.
+type LocalBuildResults = Vec<Result<BuiltProfile, RunDeployError>>;
+
 fn separator(_state: &ProgressState, w: &mut dyn std::fmt::Write) {
     let _ = write!(w, "│");
 }
@@ -730,10 +738,7 @@ async fn run_deploy(
     // push, activate, confirm, and revoke. The async pipeline below reorders
     // and regroups profiles by host, so closures are keyed by (node, profile)
     // instead of threaded through a parallel Vec.
-    let (remote_results, local_results): (
-        Vec<Result<Vec<(String, String, String)>, RunDeployError>>,
-        Vec<Result<(String, String, String), RunDeployError>>,
-    ) = join!(
+    let (remote_results, local_results): (RemoteBuildResults, LocalBuildResults) = join!(
         // remote builds can be run asynchronously
         async move {
             let mut set = JoinSet::new();
@@ -774,7 +779,8 @@ async fn run_deploy(
                         match deploy::push::build_profile(&profile).await {
                             Ok(closure) => built.push((nodename, profilename, closure)),
                             Err(e) => {
-                                result = Err(RunDeployError::BuildProfile(profilename, nodename, e));
+                                result =
+                                    Err(RunDeployError::BuildProfile(profilename, nodename, e));
                                 break;
                             }
                         }
@@ -841,9 +847,16 @@ async fn run_deploy(
                                     profile_name, node_name
                                 ));
                             }
-                            let res = deploy::push::push_profile(&data, &closure).await.map_err(|e| {
-                                RunDeployError::PushProfile(profile_name.clone(), node_name.clone(), e)
-                            });
+                            let res =
+                                deploy::push::push_profile(&data, &closure)
+                                    .await
+                                    .map_err(|e| {
+                                        RunDeployError::PushProfile(
+                                            profile_name.clone(),
+                                            node_name.clone(),
+                                            e,
+                                        )
+                                    });
                             if let Some(pb) = &pb {
                                 match &res {
                                     Ok(()) => {
@@ -895,10 +908,20 @@ async fn run_deploy(
     let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs, &str)> = vec![];
     for (_, deploy_data, deploy_defs) in &parts {
         let closure = closures
-            .get(&(deploy_data.node_name.clone(), deploy_data.profile_name.clone()))
+            .get(&(
+                deploy_data.node_name.clone(),
+                deploy_data.profile_name.clone(),
+            ))
             .expect("every profile should have a build closure recorded");
-        if let Err(e) =
-            deploy::deploy::deploy_profile(deploy_data, deploy_defs, closure, dry_activate, boot, test).await
+        if let Err(e) = deploy::deploy::deploy_profile(
+            deploy_data,
+            deploy_defs,
+            closure,
+            dry_activate,
+            boot,
+            test,
+        )
+        .await
         {
             error!("{}", e);
             if dry_activate {

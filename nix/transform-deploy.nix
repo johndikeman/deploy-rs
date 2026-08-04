@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Serokell <https://serokell.io/>
+#
+# SPDX-License-Identifier: MPL-2.0
+
 # Returns a transformed copy of `deploy` where any profile whose `path`
 # evaluated to a derivation also exposes that derivation's `drvPath`. This
 # lets deploy-rs build content-addressed and floating-output derivations,

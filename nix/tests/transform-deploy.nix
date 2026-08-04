@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Serokell <https://serokell.io/>
+#
+# SPDX-License-Identifier: MPL-2.0
+
 # Pure-evaluation test for `../transform-deploy.nix`. The test runs without a
 # VM and without building anything beyond a trivial `runCommand`, so it is
 # cheap enough to run on every `nix flake check`.

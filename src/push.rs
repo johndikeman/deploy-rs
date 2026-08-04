@@ -136,7 +136,10 @@ pub async fn build_profile_locally(
         // `--print-out-paths` makes `nix build` write the realised output
         // to stdout. `nix-build` writes the path to stdout by default so
         // the flag only applies to the flake branch.
-        build_command.arg("build").arg(derivation_name).arg("--print-out-paths")
+        build_command
+            .arg("build")
+            .arg(derivation_name)
+            .arg("--print-out-paths")
     } else {
         build_command.arg(derivation_name)
     };
@@ -205,7 +208,9 @@ pub async fn build_profile_locally(
             stderr: Vec::new(),
         }
     } else {
-        build_command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+        build_command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
         command::Command::new(build_command)
             .run()
             .await
@@ -567,7 +572,9 @@ pub async fn build_profile_remotely(
             let stdout = stdout_task
                 .await
                 .map_err(|e| {
-                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(e)))
+                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(
+                        e,
+                    )))
                 })?
                 .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
 
@@ -579,7 +586,9 @@ pub async fn build_profile_remotely(
         } else {
             // No progress bar: let nix write its native output to the terminal.
             debug!("build command: {:?}", build_command);
-            build_command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+            build_command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
             command::Command::new(build_command)
                 .run()
                 .await
@@ -598,7 +607,12 @@ pub async fn build_profile_remotely(
 pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfileError> {
     let profile_settings = &data.deploy_data.profile.profile_settings;
 
-    let supports_caret = data.supports_flakes || data.deploy_data.merged_settings.remote_build.unwrap_or(false);
+    let supports_caret = data.supports_flakes
+        || data
+            .deploy_data
+            .merged_settings
+            .remote_build
+            .unwrap_or(false);
 
     // The eval transformation in `nix/transform-deploy.nix` attaches `drvPath`
     // to every derivation-typed profile path, so this branch is hit whenever
@@ -633,7 +647,10 @@ pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfile
             Some(0) => (),
             _exit_code => {
                 return Err(PushProfileError::ShowDerivation(
-                    command::CommandError::Exit(show_derivation_output, show_derivation_command_str),
+                    command::CommandError::Exit(
+                        show_derivation_output,
+                        show_derivation_command_str,
+                    ),
                 ));
             }
         };
@@ -660,11 +677,12 @@ pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfile
                 command::CommandError::OtherError(ShowDerivationError::Invalid),
             ))?;
 
-        let deriver_key = derivation_info.keys().next().ok_or(
-            PushProfileError::ShowDerivation(command::CommandError::OtherError(
-                ShowDerivationError::Empty,
-            )),
-        )?;
+        let deriver_key = derivation_info
+            .keys()
+            .next()
+            .ok_or(PushProfileError::ShowDerivation(
+                command::CommandError::OtherError(ShowDerivationError::Empty),
+            ))?;
 
         // Nix 2.32+ returns relative paths (without /nix/store/ prefix) in show-derivation output
         // Normalize to always use full store paths
@@ -677,7 +695,12 @@ pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfile
         deriver_for_build(deriver, supports_caret).await?
     };
 
-    if data.deploy_data.merged_settings.remote_build.unwrap_or(false) {
+    if data
+        .deploy_data
+        .merged_settings
+        .remote_build
+        .unwrap_or(false)
+    {
         if !data.supports_flakes {
             warn!("remote builds using non-flake nix are experimental");
         }
@@ -695,7 +718,10 @@ pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfile
 /// detect which case applies by asking `nix path-info <drv>`; on 2.15 and newer
 /// it echoes the `.drv` back, while on older versions it resolves to the
 /// realised output or errors out if the output is not yet built.
-async fn deriver_for_build(deriver: String, supports_caret: bool) -> Result<String, PushProfileError> {
+async fn deriver_for_build(
+    deriver: String,
+    supports_caret: bool,
+) -> Result<String, PushProfileError> {
     if !supports_caret {
         return Ok(deriver);
     }
@@ -820,7 +846,6 @@ pub async fn push_profile(data: &PushProfileData, closure: &str) -> Result<(), P
     Ok(())
 }
 
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -854,4 +879,3 @@ mod test {
         assert!(matches!(err, PushProfileError::BuildStdoutMultiline(_)));
     }
 }
-

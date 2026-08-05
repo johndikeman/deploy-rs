@@ -295,6 +295,7 @@ pub async fn confirm_profile(
     deploy_defs: &super::DeployDefs,
     temp_path: &Path,
     ssh_addr: &str,
+    closure: &str,
 ) -> Result<(), ConfirmProfileError> {
     let mut ssh_confirm_command = Command::new("ssh");
     ssh_confirm_command
@@ -305,7 +306,7 @@ pub async fn confirm_profile(
         ssh_confirm_command.arg(ssh_opt);
     }
 
-    let lock_path = super::make_lock_path(temp_path, &deploy_data.profile.profile_settings.path);
+    let lock_path = super::make_lock_path(temp_path, closure);
 
     let mut confirm_command = format!("rm {}", lock_path.display());
     if let Some(sudo_cmd) = &deploy_defs.sudo {
@@ -397,6 +398,7 @@ pub enum DeployProfileError {
 pub async fn deploy_profile(
     deploy_data: &super::DeployData,
     deploy_defs: &super::DeployDefs,
+    closure: &str,
     dry_activate: bool,
     boot: bool,
     test: bool,
@@ -424,7 +426,7 @@ pub async fn deploy_profile(
     let self_activate_command = build_activate_command(&ActivateCommandData {
         sudo: &deploy_defs.sudo,
         profile_info: &deploy_data.get_profile_info()?,
-        closure: &deploy_data.profile.profile_settings.path,
+        closure,
         auto_rollback,
         temp_path,
         confirm_timeout,
@@ -506,7 +508,7 @@ pub async fn deploy_profile(
     } else {
         let self_wait_command = build_wait_command(&WaitCommandData {
             sudo: &deploy_defs.sudo,
-            closure: &deploy_data.profile.profile_settings.path,
+            closure,
             temp_path,
             activation_timeout,
             debug_logs: deploy_data.debug_logs,
@@ -625,7 +627,7 @@ pub async fn deploy_profile(
 
         info!("Success activating, attempting to confirm activation");
 
-        let c = confirm_profile(deploy_data, deploy_defs, temp_path, &ssh_addr).await;
+        let c = confirm_profile(deploy_data, deploy_defs, temp_path, &ssh_addr, closure).await;
         recv_activated.await.map_err(|x| {
             DeployProfileError::SSHActivate(command::CommandError::OtherError(
                 SSHActivateError::Timeout(x),
@@ -664,10 +666,11 @@ pub enum RevokeProfileError {
 pub async fn revoke(
     deploy_data: &crate::DeployData,
     deploy_defs: &crate::DeployDefs,
+    closure: &str,
 ) -> Result<(), RevokeProfileError> {
     let self_revoke_command = build_revoke_command(&RevokeCommandData {
         sudo: &deploy_defs.sudo,
-        closure: &deploy_data.profile.profile_settings.path,
+        closure,
         profile_info: deploy_data.get_profile_info()?,
         debug_logs: deploy_data.debug_logs,
         log_dir: deploy_data.log_dir.as_deref(),

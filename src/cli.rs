@@ -221,6 +221,13 @@ async fn get_deployment_data(
         Command::new("nix-instantiate")
     };
 
+    // Auto-extracts `drvPath` for profiles whose `path` is a derivation, so the
+    // binary can resolve content-addressed and floating-output derivations
+    // whose eval-time `outPath` is a placeholder. The Nix file is a
+    // self-contained function from `deploy` to `deploy`; see
+    // `nix/transform-deploy.nix`.
+    let patch_deploy = include_str!("../nix/transform-deploy.nix");
+
     if supports_flakes {
         eval_command
             .arg("eval")
@@ -234,7 +241,8 @@ async fn get_deployment_data(
                 eval_command.arg(format!(
                     r#"
                       deploy:
-                      (deploy // {{
+                      let patchDeploy = ({2}); in
+                      patchDeploy (deploy // {{
                         nodes = {{
                           "{0}" = deploy.nodes."{0}" // {{
                             profiles = {{
@@ -244,7 +252,7 @@ async fn get_deployment_data(
                         }};
                       }})
                      "#,
-                    node, profile
+                    node, profile, patch_deploy
                 ))
             }
             (Some(node), None) => {
@@ -252,18 +260,19 @@ async fn get_deployment_data(
                 eval_command.arg(format!(
                     r#"
                       deploy:
-                      (deploy // {{
+                      let patchDeploy = ({1}); in
+                      patchDeploy (deploy // {{
                         nodes = {{
-                          inherit (deploy.nodes) "{}";
+                          inherit (deploy.nodes) "{0}";
                         }};
                       }})
                     "#,
-                    node
+                    node, patch_deploy
                 ))
             }
             (None, None) => {
                 // We need to evaluate all profiles of all nodes anyway, so just do it strictly
-                eval_command.arg("deploy: deploy")
+                eval_command.arg(format!("deploy: ({}) deploy", patch_deploy))
             }
             (None, Some(_)) => return Err(GetDeploymentDataError::ProfileNoNode),
         }
@@ -274,7 +283,10 @@ async fn get_deployment_data(
             .arg("--json")
             .arg("--eval")
             .arg("-E")
-            .arg(format!("let r = import {}/.; in if builtins.isFunction r then (r {{}}).deploy else r.deploy", flake.repo))
+            .arg(format!(
+                "({1}) (let r = import {0}/.; in if builtins.isFunction r then (r {{}}).deploy else r.deploy)",
+                flake.repo, patch_deploy
+            ))
     };
 
     eval_command.args(extra_build_args).stdout(Stdio::piped());
@@ -323,6 +335,14 @@ fn print_deployment(
     let mut part_map: HashMap<String, HashMap<String, PromptPart>> = HashMap::new();
 
     for (_, data, defs) in parts {
+        let settings = &data.profile.profile_settings;
+        // Pre-build, a floating-output profile's `path` is just an opaque
+        // placeholder. Show the `.drv` instead so the preview is meaningful.
+        let displayed_path: &str = if settings.path.starts_with("/nix/store/") {
+            &settings.path
+        } else {
+            settings.drv_path.as_deref().unwrap_or(&settings.path)
+        };
         part_map
             .entry(data.node_name.to_string())
             .or_default()
@@ -331,7 +351,7 @@ fn print_deployment(
                 PromptPart {
                     user: &defs.profile_user,
                     ssh_user: &defs.ssh_user,
-                    path: &data.profile.profile_settings.path,
+                    path: displayed_path,
                     hostname: &data.node.node_settings.hostname,
                     ssh_opts: &data.merged_settings.ssh_opts,
                 },
@@ -442,6 +462,14 @@ type ToDeploy<'a> = Vec<(
     (&'a str, &'a deploy::data::Node),
     (&'a str, &'a deploy::data::Profile),
 )>;
+
+// (node_name, profile_name, closure) for a profile that finished building.
+type BuiltProfile = (String, String, String);
+// Per-host build results from the async remote-build pipeline: one Vec of
+// BuiltProfile per host (built in order), or an error if that host's build failed.
+type RemoteBuildResults = Vec<Result<Vec<BuiltProfile>, RunDeployError>>;
+// Per-profile build+push results from the async local-build pipeline.
+type LocalBuildResults = Vec<Result<BuiltProfile, RunDeployError>>;
 
 fn separator(_state: &ProgressState, w: &mut dyn std::fmt::Write) {
     let _ = write!(w, "│");
@@ -705,7 +733,12 @@ async fn run_deploy(
     };
     let new_spinner = || ProgressBar::new_spinner().with_style(spinner_style.clone());
 
-    let (remote_results, local_results) = join!(
+    // Build (and, for local profiles, push) phase. Each profile's build yields
+    // its realised /nix/store/... path, which every subsequent step needs:
+    // push, activate, confirm, and revoke. The async pipeline below reorders
+    // and regroups profiles by host, so closures are keyed by (node, profile)
+    // instead of threaded through a parallel Vec.
+    let (remote_results, local_results): (RemoteBuildResults, LocalBuildResults) = join!(
         // remote builds can be run asynchronously
         async move {
             let mut set = JoinSet::new();
@@ -722,7 +755,8 @@ async fn run_deploy(
                 };
 
                 set.spawn(async move {
-                    let mut res = Ok(());
+                    let mut built = Vec::new();
+                    let mut result = Ok(());
 
                     // build profile in order, one after the other
                     for mut profile in profiles {
@@ -742,32 +776,30 @@ async fn run_deploy(
                             profilename, nodename
                         );
 
-                        res = deploy::push::build_profile(&profile).await.map_err(|e| {
-                            RunDeployError::BuildProfile(
-                                profilename.to_string(),
-                                nodename.to_string(),
-                                e,
-                            )
-                        });
-                        if res.is_err() {
-                            break;
+                        match deploy::push::build_profile(&profile).await {
+                            Ok(closure) => built.push((nodename, profilename, closure)),
+                            Err(e) => {
+                                result =
+                                    Err(RunDeployError::BuildProfile(profilename, nodename, e));
+                                break;
+                            }
                         }
                     }
 
                     if let Some(pb) = &pb {
-                        match res {
+                        match &result {
                             Ok(()) => {
                                 pb.set_style(finish_style());
                                 pb.finish_with_message("Done!");
                             }
-                            Err(ref e) => {
+                            Err(e) => {
                                 pb.set_style(finish_style_error());
                                 pb.finish_with_message(format!("Error: {}", e));
                             }
                         }
                     }
 
-                    res
+                    result.map(|()| built)
                 });
             }
 
@@ -801,12 +833,12 @@ async fn run_deploy(
                     None
                 };
 
-                let res = deploy::push::build_profile(&data).await.map_err(|e| {
+                let build_result = deploy::push::build_profile(&data).await.map_err(|e| {
                     RunDeployError::BuildProfile(profile_name.clone(), node_name.clone(), e)
                 });
 
-                match res {
-                    Ok(()) => {
+                match build_result {
+                    Ok(closure) => {
                         set.spawn(async move {
                             let data = data.clone();
                             if let Some(pb) = &pb {
@@ -815,25 +847,32 @@ async fn run_deploy(
                                     profile_name, node_name
                                 ));
                             }
-                            let res = deploy::push::push_profile(&data).await.map_err(|e| {
-                                RunDeployError::PushProfile(profile_name, node_name, e)
-                            });
+                            let res =
+                                deploy::push::push_profile(&data, &closure)
+                                    .await
+                                    .map_err(|e| {
+                                        RunDeployError::PushProfile(
+                                            profile_name.clone(),
+                                            node_name.clone(),
+                                            e,
+                                        )
+                                    });
                             if let Some(pb) = &pb {
-                                match res {
+                                match &res {
                                     Ok(()) => {
                                         pb.set_style(finish_style());
                                         pb.finish_with_message("Done!");
                                     }
-                                    Err(ref e) => {
+                                    Err(e) => {
                                         pb.set_style(finish_style_error());
                                         pb.finish_with_message(format!("Error: {}", e));
                                     }
                                 }
                             }
-                            res
+                            res.map(|()| (node_name, profile_name, closure))
                         });
                     }
-                    Err(ref e) => {
+                    Err(e) => {
                         if let Some(pb) = &pb {
                             pb.set_style(finish_style_error());
                             pb.finish_with_message(format!("Error: {}", e));
@@ -841,7 +880,7 @@ async fn run_deploy(
                         // "spawn" a future that just returns the error when building locally fails
                         // this will ensure that the deployment is actually aborted in the error
                         // handling code below
-                        set.spawn(async move { res });
+                        set.spawn(async move { Err(e) });
                     }
                 }
             }
@@ -849,22 +888,40 @@ async fn run_deploy(
         }
     );
 
-    // abort here if any build + push or push + build failed
+    // abort here if any build + push or push + build failed, and collect the
+    // realised closure for every profile that made it through
+    let mut closures: HashMap<(String, String), String> = HashMap::new();
     for result in remote_results {
-        result?
+        for (node_name, profile_name, closure) in result? {
+            closures.insert((node_name, profile_name), closure);
+        }
     }
     for result in local_results {
-        result?
+        let (node_name, profile_name, closure) = result?;
+        closures.insert((node_name, profile_name), closure);
     }
 
     // Run all activations
     // In case of an error, rollback any previoulsy made deployment.
     // Rollbacks adhere to the global seeting to auto_rollback and secondary
     // the profile's configuration
-    let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs)> = vec![];
+    let mut succeeded: Vec<(&deploy::DeployData, &deploy::DeployDefs, &str)> = vec![];
     for (_, deploy_data, deploy_defs) in &parts {
-        if let Err(e) =
-            deploy::deploy::deploy_profile(deploy_data, deploy_defs, dry_activate, boot, test).await
+        let closure = closures
+            .get(&(
+                deploy_data.node_name.clone(),
+                deploy_data.profile_name.clone(),
+            ))
+            .expect("every profile should have a build closure recorded");
+        if let Err(e) = deploy::deploy::deploy_profile(
+            deploy_data,
+            deploy_defs,
+            closure,
+            dry_activate,
+            boot,
+            test,
+        )
+        .await
         {
             error!("{}", e);
             if dry_activate {
@@ -875,9 +932,9 @@ async fn run_deploy(
                 // revoking all previous deploys
                 // (adheres to profile configuration if not set explicitely by
                 //  the command line)
-                for (deploy_data, deploy_defs) in &succeeded {
+                for (deploy_data, deploy_defs, prev_closure) in &succeeded {
                     if deploy_data.merged_settings.auto_rollback.unwrap_or(true) {
-                        deploy::deploy::revoke(deploy_data, deploy_defs)
+                        deploy::deploy::revoke(deploy_data, deploy_defs, prev_closure)
                             .await
                             .map_err(|e| {
                                 RunDeployError::RevokeProfile(
@@ -896,7 +953,7 @@ async fn run_deploy(
                 e,
             ));
         }
-        succeeded.push((deploy_data, deploy_defs))
+        succeeded.push((deploy_data, deploy_defs, closure.as_str()))
     }
 
     Ok(())

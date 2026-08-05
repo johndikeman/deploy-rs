@@ -173,4 +173,6 @@ in {
     flakes = true;
     deployArgs = "--file . --targets server";
   };
+  # Pure-evaluation test for the drvPath auto-extraction. Runs without a VM.
+  transform-deploy = import ./transform-deploy.nix { inherit pkgs; };
 }

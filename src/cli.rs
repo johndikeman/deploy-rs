@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::collections::HashMap;
-use std::io::{stdin, stdout, Write};
+use std::io::{stdin, stdout, IsTerminal, Write};
 use std::time::Duration;
 
 use clap::{ArgMatches, FromArgMatches, Parser};
@@ -54,6 +54,11 @@ pub struct Opts {
     /// Directory to print logs to (including the background activation process)
     #[arg(long)]
     log_dir: Option<String>,
+    /// Disable the progress bars shown for concurrent builds (multiple remote
+    /// hosts) on a terminal, letting nix write its output directly — e.g. to
+    /// pipe deploy into nix-output-monitor or capture clean CI logs.
+    #[arg(long)]
+    no_progress: bool,
 
     /// Keep the build outputs of each built profile
     #[arg(short, long)]
@@ -492,6 +497,7 @@ async fn run_deploy(
     test: bool,
     log_dir: &Option<String>,
     rollback_succeeded: bool,
+    no_progress: bool,
     mp: MultiProgress,
 ) -> Result<(), RunDeployError> {
     let to_deploy: ToDeploy = deploy_flakes
@@ -709,11 +715,13 @@ async fn run_deploy(
                 }
             });
 
-    // Progress bars only used when building on more than one remote host at once.
-    // For a purely local build, or a single remote host, there is no concurrency,
-    // so we let nix write its native output (native `-L`, errors and progress)
-    // directly to the terminal instead.
-    let use_progress = remote_build_map.len() > 1;
+    // Show a progress bar only when building on more than one remote host at once
+    // (concurrent output), writing to a real terminal, and not disabled via
+    // --no-progress. Otherwise — a local build, a single remote host, output piped
+    // to a file/CI/nix-output-monitor, or the flag — nix writes its native output
+    // (native `-L`, errors, progress, or forwarded `internal-json`) directly.
+    let use_progress =
+        !no_progress && remote_build_map.len() > 1 && std::io::stderr().is_terminal();
 
     // show progress information
     let remote_mp = mp.clone();
@@ -1066,6 +1074,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         opts.test,
         &opts.log_dir,
         opts.rollback_succeeded.unwrap_or(true),
+        opts.no_progress,
         mp,
     )
     .await?;

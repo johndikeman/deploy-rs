@@ -208,13 +208,15 @@ pub async fn build_profile_locally(
             stderr: Vec::new(),
         }
     } else {
-        build_command
+        let child = build_command
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        command::Command::new(build_command)
-            .run()
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
+        child
+            .wait_with_output()
             .await
-            .map_err(PushProfileError::Build)?
+            .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?
     };
 
     match build_output.status.code() {
@@ -586,13 +588,15 @@ pub async fn build_profile_remotely(
         } else {
             // No progress bar: let nix write its native output to the terminal.
             debug!("build command: {:?}", build_command);
-            build_command
+            let child = build_command
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit());
-            command::Command::new(build_command)
-                .run()
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
+            child
+                .wait_with_output()
                 .await
-                .map_err(PushProfileError::Build)?
+                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?
         }
     };
 
